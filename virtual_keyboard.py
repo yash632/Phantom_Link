@@ -46,18 +46,6 @@ class TopRow3DDipVirtualKeyboard:
         self.drag_x = 0
         self.drag_y = 0
 
-        # Virtual Mouse & Auto Mode Switch States
-        self.active_mode = "KEYBOARD"
-        self.screen_w, self.screen_h = pyautogui.size()
-        self.prev_mouse_x, self.prev_mouse_y = self.screen_w // 2, self.screen_h // 2
-        self.mouse_ema_alpha = 0.35
-        self.mouse_dpi = 3.2  # Mouse Sensitivity / DPI Multiplier (Increase for faster cursor speed)
-        self.prev_pinch_pos = None
-        self.pinch_threshold = 0.18  # Tightened pinch distance threshold
-        self.last_mid_tap_time = 0.0
-        self.last_swipe_time = 0.0
-        self.swipe_start_x = 0.0
-
         # Setup Floating HUD UI
         self.setup_ui()
 
@@ -93,10 +81,8 @@ class TopRow3DDipVirtualKeyboard:
         self.canvas.bind("<Button-1>", self.start_move)
         self.canvas.bind("<B1-Motion>", self.do_move)
 
-        # Show/Hide Hotkey Binding (F9) and DPI Adjustment Bindings (F8/F10)
+        # Show/Hide Hotkey Binding (F9)
         self.root.bind_all("<F9>", lambda event: self.toggle_hud())
-        self.root.bind_all("<F10>", lambda event: self.adjust_dpi(0.5))
-        self.root.bind_all("<F8>", lambda event: self.adjust_dpi(-0.5))
 
         self.update_ui_loop()
 
@@ -108,10 +94,6 @@ class TopRow3DDipVirtualKeyboard:
         x = self.root.winfo_x() + (event.x - self.drag_x)
         y = self.root.winfo_y() + (event.y - self.drag_y)
         self.root.geometry(f"+{x}+{y}")
-
-    def adjust_dpi(self, delta):
-        self.mouse_dpi = round(min(6.0, max(1.0, self.mouse_dpi + delta)), 1)
-        print(f"[INFO] Mouse DPI Speed Updated: {self.mouse_dpi}x")
 
     def toggle_hud(self):
         self.hud_visible = not self.hud_visible
@@ -418,387 +400,294 @@ class TopRow3DDipVirtualKeyboard:
             else:
                 self.smoothed_landmarks.clear()
 
+            # Global hand scale reference
+            ref_hand_scale = 0.20
+            if assigned_hands:
+                scales = [max(0.08, self.dist(h_data[1][0], h_data[1][9])) for h_data in assigned_hands.values()]
+                ref_hand_scale = sum(scales) / len(scales)
+
             # -----------------------------------------------------------------
-            # AUTO MODE SWITCHER: 1 Hand = VIRTUAL MOUSE, 2 Hands = KEYBOARD
+            # GESTURE 1: SPACE (Both index Touch -> Enter)
             # -----------------------------------------------------------------
-            num_hands = len(assigned_hands)
-            if num_hands >= 2:
-                self.active_mode = "KEYBOARD"
-                self.hud_visible = True
-            elif num_hands == 1:
-                self.active_mode = "MOUSE"
-                self.hud_visible = False  # Completely hide keyboard HUD & key badges!
-            else:
-                self.active_mode = "IDLE"
+            is_enter_active = False
+            if "Left" in assigned_hands and "Right" in assigned_hands:
+                l_index = assigned_hands["Left"][1][8]
+                r_index = assigned_hands["Right"][1][8]
+                if (self.dist(l_index, r_index) / ref_hand_scale) < 0.28:
+                    is_enter_active = True
+                    cx1, cy1 = int(l_index[0] * w), int(l_index[1] * h)
+                    cx2, cy2 = int(r_index[0] * w), int(r_index[1] * h)
+                    cv2.line(frame, (cx1, cy1), (cx2, cy2), (200, 100, 255), 4)
+                    cv2.circle(frame, (int((cx1+cx2)/2), int((cy1+cy2)/2)), 24, (200, 100, 255), cv2.FILLED)
+                    cv2.putText(frame, "ENTER KEY", (int((cx1+cx2)/2) - 60, int((cy1+cy2)/2) - 25), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (200, 100, 255), 2)
 
-            # =================================================================
-            # MODE A: VIRTUAL MOUSE ENGINE (SINGLE HAND MODE)
-            # =================================================================
-            if self.active_mode == "MOUSE":
-                label, (mean_x, smooth_lms, raw_lms) = list(assigned_hands.items())[0]
-                mp_draw.draw_landmarks(frame, raw_lms, mp_hands.HAND_CONNECTIONS)
-
-                thumb_tip = smooth_lms[4]
-                index_tip = smooth_lms[8]
-                middle_tip = smooth_lms[12]
-                ring_tip = smooth_lms[16]
-                pinky_tip = smooth_lms[20]
-                wrist = smooth_lms[0]
-                mcp = smooth_lms[9]
-                hand_scale = max(0.08, self.dist(wrist, mcp))
-                now = time.time()
-
-                # 1. Pinch-to-Move Control with Relative Delta (Trackpad Style - No Teleportation!)
-                pinch_dist = self.dist(thumb_tip, index_tip) / hand_scale
-                is_pinched = (pinch_dist < self.pinch_threshold)
-
-                if is_pinched:
-                    curr_pinch = (index_tip[0], index_tip[1])
-                    if self.prev_pinch_pos is None:
-                        # Just pinched: set anchor without moving cursor!
-                        self.prev_pinch_pos = curr_pinch
-                    else:
-                        # Relative finger movement delta (dx, dy) scaled by self.mouse_dpi
-                        dx = (curr_pinch[0] - self.prev_pinch_pos[0]) * self.screen_w * self.mouse_dpi
-                        dy = (curr_pinch[1] - self.prev_pinch_pos[1]) * self.screen_h * self.mouse_dpi
-
-                        target_x = int(self.prev_mouse_x + dx)
-                        target_y = int(self.prev_mouse_y + dy)
-
-                        # Clamp target to screen boundaries
-                        target_x = max(0, min(self.screen_w - 1, target_x))
-                        target_y = max(0, min(self.screen_h - 1, target_y))
-
-                        # Smooth with EMA
-                        smooth_x = int(self.prev_mouse_x + self.mouse_ema_alpha * (target_x - self.prev_mouse_x))
-                        smooth_y = int(self.prev_mouse_y + self.mouse_ema_alpha * (target_y - self.prev_mouse_y))
-
-                        pyautogui.moveTo(smooth_x, smooth_y)
-                        self.prev_mouse_x, self.prev_mouse_y = smooth_x, smooth_y
-                        self.prev_pinch_pos = curr_pinch
-
-                    # Draw Cyan Pinch Line & Indicator on Camera Feed
-                    cx1, cy1 = int(thumb_tip[0] * w), int(thumb_tip[1] * h)
-                    cx2, cy2 = int(index_tip[0] * w), int(index_tip[1] * h)
-                    cv2.line(frame, (cx1, cy1), (cx2, cy2), (255, 255, 0), 4)
-                    cv2.circle(frame, (cx2, cy2), 14, (255, 255, 0), cv2.FILLED)
-                    cv2.putText(frame, "TRACKPAD MOVING", (cx2 - 60, cy2 - 20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                    if not self.index_are_touching:
+                        self.index_are_touching = True
+                        self.trigger_action('ENTER', 'ENTER_TRIGGER')
                 else:
-                    # Un-pinched -> Reset anchor position & KEEP CURSOR FROZEN WHERE LEFT!
-                    self.prev_pinch_pos = None
-                    cx, cy = int(index_tip[0] * w), int(index_tip[1] * h)
-                    cv2.circle(frame, (cx, cy), 8, (0, 165, 255), 2)
-                    cv2.putText(frame, "PINCH TO DRAG MOUSE", (cx - 65, cy - 20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+                    self.index_are_touching = False
 
-                # 2. Mouse Gestures (Left Click, Right Click, Double Click, 3-Finger Tab Switch)
-                # Left Click & Double Click (Middle Finger Dip)
-                m_rel_y = (middle_tip[1] - mcp[1]) / hand_scale
-                m_hist = self.finger_y_history["MOUSE_MID"]
-                m_hist.append((m_rel_y, now))
-
-                m_vel = 0.0
-                dy = 0.0
-                if len(m_hist) >= 3:
-                    dt = m_hist[-1][1] - m_hist[0][1]
-                    dy = m_hist[-1][0] - m_hist[0][0]
-                    if dt > 0.001:
-                        m_vel = dy / dt
-
-                if m_vel > 0.60 and dy > 0.014 and self.finger_states["MOUSE_MID"] == 'READY':
-                    self.finger_states["MOUSE_MID"] = 'STRUCK'
-                    if (now - self.last_mid_tap_time) < 0.32:
-                        pyautogui.doubleClick()
-                        toast = "DOUBLE CLICK"
-                    else:
-                        pyautogui.click(button='left')
-                        toast = "LEFT CLICK"
-                    self.last_mid_tap_time = now
-
-                    cx, cy = int(middle_tip[0] * w), int(middle_tip[1] * h)
-                    cv2.circle(frame, (cx, cy), 22, (0, 255, 0), cv2.FILLED)
-                    cv2.putText(frame, toast, (cx - 40, cy - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                elif m_vel < 0.20 or dy < 0.005 or (now - self.last_mid_tap_time > 0.25):
-                    self.finger_states["MOUSE_MID"] = 'READY'
-
-                # Right Click (Ring Finger Dip)
-                r_rel_y = (ring_tip[1] - mcp[1]) / hand_scale
-                r_hist = self.finger_y_history["MOUSE_RING"]
-                r_hist.append((r_rel_y, now))
-
-                r_vel = 0.0
-                r_dy = 0.0
-                if len(r_hist) >= 3:
-                    dt = r_hist[-1][1] - r_hist[0][1]
-                    r_dy = r_hist[-1][0] - r_hist[0][0]
-                    if dt > 0.001:
-                        r_vel = r_dy / dt
-
-                if r_vel > 0.60 and r_dy > 0.014 and self.finger_states["MOUSE_RING"] == 'READY':
-                    self.finger_states["MOUSE_RING"] = 'STRUCK'
-                    pyautogui.click(button='right')
-                    cx, cy = int(ring_tip[0] * w), int(ring_tip[1] * h)
-                    cv2.circle(frame, (cx, cy), 22, (0, 200, 255), cv2.FILLED)
-                    cv2.putText(frame, "RIGHT CLICK", (cx - 45, cy - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
-                elif r_vel < 0.20 or r_dy < 0.005 or (now - self.last_strike_time["MOUSE_RING"] > 0.25):
-                    self.finger_states["MOUSE_RING"] = 'READY'
-
-                # 3-Finger Swipe Gesture (Index + Middle + Ring Extended)
-                i_ext = (index_tip[1] < mcp[1])
-                m_ext = (middle_tip[1] < mcp[1])
-                r_ext = (ring_tip[1] < mcp[1])
-
-                if i_ext and m_ext and r_ext and not is_pinched:
-                    cx_3 = (index_tip[0] + middle_tip[0] + ring_tip[0]) / 3
-                    if self.swipe_start_x == 0.0:
-                        self.swipe_start_x = cx_3
-                    else:
-                        swipe_dx = cx_3 - self.swipe_start_x
-                        if (now - self.last_swipe_time) > 0.35:
-                            if swipe_dx > 0.14:  # Swipe Right
-                                pyautogui.hotkey('ctrl', 'tab')
-                                self.last_swipe_time = now
-                                self.swipe_start_x = cx_3
-                                cv2.putText(frame, "NEXT TAB (Ctrl+Tab)", (w//2 - 120, h//2), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 100, 255), 2)
-                            elif swipe_dx < -0.14:  # Swipe Left
-                                pyautogui.hotkey('ctrl', 'shift', 'tab')
-                                self.last_swipe_time = now
-                                self.swipe_start_x = cx_3
-                                cv2.putText(frame, "PREV TAB (Ctrl+Shift+Tab)", (w//2 - 140, h//2), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 100, 255), 2)
-                else:
-                    self.swipe_start_x = 0.0
-
-                # Header info in Camera Window (Mouse Mode)
-                cv2.rectangle(frame, (0, 0), (w, 42), (20, 20, 20), cv2.FILLED)
-                cv2.putText(frame, f"🖱️ VIRTUAL MOUSE [DPI: {self.mouse_dpi}x (F8/F10)]: Pinch to Move | Mid=L-Click | Ring=R-Click", 
-                            (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 2)
-
-            # =================================================================
-            # MODE B: KEYBOARD ENGINE (DUAL HANDS MODE)
-            # =================================================================
-            elif self.active_mode == "KEYBOARD":
-                # Global hand scale reference
-                ref_hand_scale = 0.20
-                if assigned_hands:
-                    scales = [max(0.08, self.dist(h_data[1][0], h_data[1][9])) for h_data in assigned_hands.values()]
-                    ref_hand_scale = sum(scales) / len(scales)
-
-                # GESTURE 1: ENTER (Both index Touch)
-                is_enter_active = False
+            # -----------------------------------------------------------------
+            # GESTURE 2: ENTER (Both index Touch Deliberately)
+            # -----------------------------------------------------------------
+            is_backspace_active = False
+            if not is_enter_active:
                 if "Left" in assigned_hands and "Right" in assigned_hands:
-                    l_index = assigned_hands["Left"][1][8]
-                    r_index = assigned_hands["Right"][1][8]
-                    if (self.dist(l_index, r_index) / ref_hand_scale) < 0.28:
-                        is_enter_active = True
-                        cx1, cy1 = int(l_index[0] * w), int(l_index[1] * h)
-                        cx2, cy2 = int(r_index[0] * w), int(r_index[1] * h)
-                        cv2.line(frame, (cx1, cy1), (cx2, cy2), (200, 100, 255), 4)
-                        cv2.circle(frame, (int((cx1+cx2)/2), int((cy1+cy2)/2)), 24, (200, 100, 255), cv2.FILLED)
-                        cv2.putText(frame, "ENTER KEY", (int((cx1+cx2)/2) - 60, int((cy1+cy2)/2) - 25), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (200, 100, 255), 2)
+                    l_thumb = assigned_hands["Left"][1][4]
+                    r_thumb = assigned_hands["Right"][1][4]
+                    thumb_contact_dist = self.dist(l_thumb, r_thumb) / ref_hand_scale
 
-                        if not self.index_are_touching:
-                            self.index_are_touching = True
-                            self.trigger_action('ENTER', 'ENTER_TRIGGER')
-                    else:
-                        self.index_are_touching = False
+                    if thumb_contact_dist < 0.25:
+                        is_backspace_active = True
+                        cx1, cy1 = int(l_thumb[0] * w), int(l_thumb[1] * h)
+                        cx2, cy2 = int(r_thumb[0] * w), int(r_thumb[1] * h)
+                        cv2.line(frame, (cx1, cy1), (cx2, cy2), (0, 0, 255), 4)
+                        cv2.circle(frame, (int((cx1+cx2)/2), int((cy1+cy2)/2)), 22, (0, 0, 255), cv2.FILLED)
+                        cv2.putText(frame, "BACKSPACE", (int((cx1+cx2)/2) - 60, int((cy1+cy2)/2) - 25), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-                # GESTURE 2: BACKSPACE (Both thumbs Touch)
-                is_backspace_active = False
-                if not is_enter_active:
-                    if "Left" in assigned_hands and "Right" in assigned_hands:
-                        l_thumb = assigned_hands["Left"][1][4]
-                        r_thumb = assigned_hands["Right"][1][4]
-                        thumb_contact_dist = self.dist(l_thumb, r_thumb) / ref_hand_scale
-
-                        if thumb_contact_dist < 0.25:
-                            is_backspace_active = True
-                            cx1, cy1 = int(l_thumb[0] * w), int(l_thumb[1] * h)
-                            cx2, cy2 = int(r_thumb[0] * w), int(r_thumb[1] * h)
-                            cv2.line(frame, (cx1, cy1), (cx2, cy2), (0, 0, 255), 4)
-                            cv2.circle(frame, (int((cx1+cx2)/2), int((cy1+cx2)/2)), 22, (0, 0, 255), cv2.FILLED)
-                            cv2.putText(frame, "BACKSPACE", (int((cx1+cx2)/2) - 60, int((cy1+cx2)/2) - 25), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-
-                            if not self.thumbs_are_touching:
-                                self.thumbs_are_touching = True
+                        if not self.thumbs_are_touching:
+                            self.thumbs_are_touching = True
+                            self.trigger_action('BACKSPACE', 'BACKSPACE_TRIGGER')
+                            self.last_backspace_time = time.time()
+                        else:
+                            if time.time() - self.last_backspace_time > 0.30:
                                 self.trigger_action('BACKSPACE', 'BACKSPACE_TRIGGER')
                                 self.last_backspace_time = time.time()
-                            else:
-                                if time.time() - self.last_backspace_time > 0.30:
-                                    self.trigger_action('BACKSPACE', 'BACKSPACE_TRIGGER')
-                                    self.last_backspace_time = time.time()
+                    else:
+                        self.thumbs_are_touching = False
+
+            # -----------------------------------------------------------------
+            # CORE MATRIX: DYNAMIC TAP IMPULSE (VELOCITY STRIKE) ENGINE
+            # -----------------------------------------------------------------
+            if not is_enter_active and not is_backspace_active:
+                for hand_label, (mean_x, smooth_lms, raw_lms) in assigned_hands.items():
+                    mp_draw.draw_landmarks(frame, raw_lms, mp_hands.HAND_CONNECTIONS)
+                    hand_prefix = 'L' if hand_label == "Left" else 'R'
+                    hand_scale = max(0.08, self.dist(smooth_lms[0], smooth_lms[9]))
+                    wrist_pt = smooth_lms[0]
+                    now = time.time()
+
+                    # Hand Label Tag on Camera
+                    cv2.putText(frame, f"[{hand_label.upper()} HAND]", (int(wrist_pt[0]*w) - 45, int(wrist_pt[1]*h) + 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+
+                    # 1. Track downward velocity / impulse for each finger
+                    finger_velocities = {}
+                    finger_deltas = {}
+                    for f_name, tip_idx in finger_tips.items():
+                        f_id = f"{hand_prefix}_{f_name}"
+                        mcp = smooth_lms[tip_idx - 3]
+                        tip = smooth_lms[tip_idx]
+
+                        # Relative tip Y position to MCP (knuckle)
+                        rel_y = (tip[1] - mcp[1]) / hand_scale
+                        f_hist = self.finger_y_history[f_id]
+                        f_hist.append((rel_y, now))
+
+                        v_down = 0.0
+                        delta_y = 0.0
+                        if len(f_hist) >= 3:
+                            dt = f_hist[-1][1] - f_hist[0][1]
+                            delta_y = f_hist[-1][0] - f_hist[0][0]
+                            if dt > 0.001:
+                                v_down = delta_y / dt
+
+                        finger_velocities[f_name] = v_down
+                        finger_deltas[f_name] = delta_y
+
+                    # 2. Inward Flexion Thumb Spacebar (Thumb Tip 4 -> Index MCP 5 distance contraction)
+                    thumb_tip = smooth_lms[4]
+                    index_mcp = smooth_lms[5]
+                    t_id = f"THUMB_{hand_label}"
+                    
+                    # Distance between thumb tip (4) and Index MCP (5) normalized by hand scale
+                    thumb_palm_dist = self.dist(thumb_tip, index_mcp) / hand_scale
+                    t_hist = self.thumb_y_history[t_id]
+                    t_hist.append((thumb_palm_dist, now))
+
+                    if len(t_hist) >= 3:
+                        t_dt = t_hist[-1][1] - t_hist[0][1]
+                        # Inward contraction: initial dist MINUS current dist (positive = moving INWARD towards palm)
+                        t_inward_delta = t_hist[0][0] - t_hist[-1][0]
+                        t_inward_vel = (t_inward_delta / t_dt) if t_dt > 0.001 else 0.0
+
+                        # Require fast high-velocity strike (jhatka strike)
+                        if t_inward_vel > 0.68 and t_inward_delta > 0.016 and self.thumb_states[t_id] == 'READY':
+                            self.thumb_states[t_id] = 'DIPPED'
+                            self.trigger_action('SPACE', 'SPACE_THUMB')
+                            cx, cy = int(thumb_tip[0] * w), int(thumb_tip[1] * h)
+                            cv2.circle(frame, (cx, cy), 22, (0, 255, 255), cv2.FILLED)
+                            cv2.putText(frame, "SPACE", (cx - 30, cy - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                        elif t_inward_vel < 0.20 or t_inward_delta < 0.005 or (time.time() - self.last_action_time.get('SPACE_THUMB', 0.0) > 0.22):
+                            self.thumb_states[t_id] = 'READY'
+
+                    # 3. Process each finger with Dynamic Tap Strike Trigger
+                    for f_name, tip_idx in finger_tips.items():
+                        f_id = f"{hand_prefix}_{f_name}"
+                        tip_pos = smooth_lms[tip_idx]
+                        mcp_pos = smooth_lms[tip_idx - 3]
+
+                        v_down = finger_velocities[f_name]
+                        delta_y = finger_deltas[f_name]
+
+                        # Isolated impulse: Strike speed minus other fingers' motion
+                        other_vels = [v for fn, v in finger_velocities.items() if fn != f_name]
+                        baseline_vel = max(0.0, sum(other_vels) / len(other_vels)) if other_vels else 0.0
+                        strike_impulse = v_down - baseline_vel
+
+                        # Horizontal reach for Index Finger (Stretch threshold set to 0.32 for natural hand fan-out)
+                        norm_x = (tip_pos[0] - mcp_pos[0]) / hand_scale
+                        is_stretched = False
+
+                        # PRE-STRIKE TARGET LOCKING: Track highest elevation (minimum Y) before dip
+                        tap_state_id = f"TAP_{f_id}"
+                        if self.finger_states[tap_state_id] == 'READY' and v_down <= 0.10:
+                            self.peak_pre_strike_y[f_id] = rel_y
+                        elif f_id not in self.peak_pre_strike_y:
+                            self.peak_pre_strike_y[f_id] = rel_y
                         else:
-                            self.thumbs_are_touching = False
+                            self.peak_pre_strike_y[f_id] = min(self.peak_pre_strike_y[f_id], f_hist[0][0] if len(f_hist) >= 3 else rel_y)
 
-                # CORE MATRIX: DYNAMIC TAP IMPULSE (VELOCITY STRIKE) ENGINE
-                if not is_enter_active and not is_backspace_active:
-                    for hand_label, (mean_x, smooth_lms, raw_lms) in assigned_hands.items():
-                        mp_draw.draw_landmarks(frame, raw_lms, mp_hands.HAND_CONNECTIONS)
-                        hand_prefix = 'L' if hand_label == "Left" else 'R'
-                        hand_scale = max(0.08, self.dist(smooth_lms[0], smooth_lms[9]))
-                        wrist_pt = smooth_lms[0]
-                        now = time.time()
+                        start_rel_y = self.peak_pre_strike_y[f_id]
 
-                        cv2.putText(frame, f"[{hand_label.upper()} HAND]", (int(wrist_pt[0]*w) - 45, int(wrist_pt[1]*h) + 30),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+                        # 3-Tier Palm-Scaled Anatomical Row Thresholds (Relaxed & Calibrated)
+                        row_tiers = {
+                            'PINKY': (-0.50, -0.16),
+                            'RING': (-0.55, -0.18),
+                            'MIDDLE': (-0.58, -0.20),
+                            'INDEX': (-0.55, -0.18)
+                        }
+                        top_t, mid_t = row_tiers[f_name]
 
-                        finger_velocities = {}
-                        finger_deltas = {}
-                        for f_name, tip_idx in finger_tips.items():
-                            f_id = f"{hand_prefix}_{f_name}"
-                            mcp = smooth_lms[tip_idx - 3]
-                            tip = smooth_lms[tip_idx]
+                        if start_rel_y < top_t:
+                            row_name = 'TOP'
+                        elif start_rel_y < mid_t:
+                            row_name = 'MID'
+                        else:
+                            row_name = 'LOW'
 
-                            rel_y = (tip[1] - mcp[1]) / hand_scale
-                            f_hist = self.finger_y_history[f_id]
-                            f_hist.append((rel_y, now))
+                        if hand_label == "Left":
+                            if f_name == "PINKY":
+                                curr_top, curr_mid, curr_low = "Q", "A", "Z"
+                            elif f_name == "RING":
+                                curr_top, curr_mid, curr_low = "W", "S", "X"
+                            elif f_name == "MIDDLE":
+                                curr_top, curr_mid, curr_low = "E", "D", "C"
+                            elif f_name == "INDEX":
+                                is_stretched = (norm_x > 0.22)
+                                if is_stretched:
+                                    curr_top, curr_mid, curr_low = "T", "G", "B"
+                                else:
+                                    curr_top, curr_mid, curr_low = "R", "F", "V"
+                        else:  # Right Hand
+                            if f_name == "INDEX":
+                                is_stretched = (norm_x < -0.22)
+                                if is_stretched:
+                                    curr_top, curr_mid, curr_low = "Y", "H", "N"
+                                else:
+                                    curr_top, curr_mid, curr_low = "U", "J", "M"
+                            elif f_name == "MIDDLE":
+                                curr_top, curr_mid, curr_low = "I", "K", ","
+                            elif f_name == "RING":
+                                curr_top, curr_mid, curr_low = "O", "L", "."
+                            elif f_name == "PINKY":
+                                curr_top, curr_mid, curr_low = "P", ";", "/"
 
-                            v_down = 0.0
-                            delta_y = 0.0
-                            if len(f_hist) >= 3:
-                                dt = f_hist[-1][1] - f_hist[0][1]
-                                delta_y = f_hist[-1][0] - f_hist[0][0]
-                                if dt > 0.001:
-                                    v_down = delta_y / dt
+                        if row_name == 'TOP':
+                            key_name = curr_top
+                        elif row_name == 'MID':
+                            key_name = curr_mid
+                        else:
+                            key_name = curr_low
 
-                            finger_velocities[f_name] = v_down
-                            finger_deltas[f_name] = delta_y
+                        tap_state_id = f"TAP_{f_id}"
+                        is_active_now = False
 
-                        thumb_tip = smooth_lms[4]
-                        thumb_mcp = smooth_lms[2]
-                        t_id = f"THUMB_{hand_label}"
-                        thumb_rel_y = (thumb_tip[1] - thumb_mcp[1]) / hand_scale
-                        t_hist = self.thumb_y_history[t_id]
-                        t_hist.append((thumb_rel_y, now))
+                        # Adaptive Strike Trigger: Light & Sensitive Tapping Across All 3 Rows
+                        if row_name == 'LOW':
+                            min_impulse, min_delta = 0.70, 0.011
+                        elif row_name == 'MID':
+                            min_impulse, min_delta = 0.70, 0.011
+                        else:
+                            min_impulse, min_delta = 0.75, 0.012
 
-                        if len(t_hist) >= 3:
-                            t_dt = t_hist[-1][1] - t_hist[0][1]
-                            t_dy = t_hist[-1][0] - t_hist[0][0]
-                            t_vel = (t_dy / t_dt) if t_dt > 0.001 else 0.0
+                        if strike_impulse > min_impulse and delta_y > min_delta:
+                            if self.finger_states[tap_state_id] == 'READY':
+                                self.finger_states[tap_state_id] = 'STRUCK'
+                                self.last_strike_time[tap_state_id] = now
+                                is_active_now = True
+                                self.trigger_action(key_name, f_id)
 
-                            if t_vel > 0.65 and t_dy > 0.016 and self.thumb_states[t_id] == 'READY':
-                                self.thumb_states[t_id] = 'DIPPED'
-                                self.trigger_action('SPACE', 'SPACE_THUMB')
-                                cx, cy = int(thumb_tip[0] * w), int(thumb_tip[1] * h)
-                                cv2.circle(frame, (cx, cy), 22, (255, 255, 0), cv2.FILLED)
-                                cv2.putText(frame, "SPACE", (cx - 30, cy - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-                            elif t_vel < 0.25 or t_dy < 0.006 or (time.time() - self.last_action_time.get('SPACE_THUMB', 0.0) > 0.28):
-                                self.thumb_states[t_id] = 'READY'
+                                # Draw Big Hit Circle
+                                cx, cy = int(tip_pos[0] * w), int(tip_pos[1] * h)
+                                if row_name == 'TOP':
+                                    hit_col = (255, 200, 0)
+                                elif row_name == 'MID':
+                                    hit_col = (0, 255, 0)
+                                else:
+                                    hit_col = (255, 120, 255)
 
-                        for f_name, tip_idx in finger_tips.items():
-                            f_id = f"{hand_prefix}_{f_name}"
-                            tip_pos = smooth_lms[tip_idx]
-                            mcp_pos = smooth_lms[tip_idx - 3]
+                                cv2.circle(frame, (cx, cy), 28, hit_col, cv2.FILLED)
+                                cv2.putText(frame, f"[{key_name}]", (cx - 25, cy - 25), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.95, hit_col, 2)
+                        elif delta_y < 0.007 or (now - self.last_strike_time[tap_state_id] > 0.18):
+                            self.finger_states[tap_state_id] = 'READY'
+                            self.peak_pre_strike_y[f_id] = rel_y
 
-                            v_down = finger_velocities[f_name]
-                            delta_y = finger_deltas[f_name]
-                            strike_impulse = v_down
+                        current_status[f_id] = {
+                            'key': key_name,
+                            'top_key': curr_top,
+                            'mid_key': curr_mid,
+                            'low_key': curr_low,
+                            'row': row_name,
+                            'flex': min(1.0, max(0.0, strike_impulse / 2.0)),
+                            'active': is_active_now,
+                            'stretched': is_stretched
+                        }
 
-                            rel_y = (tip_pos[1] - mcp_pos[1]) / hand_scale
-                            peak_y = self.peak_pre_strike_y.get(f_id, rel_y)
-                            start_rel_y = min(rel_y, peak_y)
+                        # Draw Finger Badge & Row Tag on Camera
+                        cx, cy = int(tip_pos[0] * w), int(tip_pos[1] * h)
+                        if is_active_now:
+                            badge_color = (0, 255, 0)
+                        elif is_stretched:
+                            badge_color = (255, 180, 0)
+                        elif row_name == 'TOP':
+                            badge_color = (0, 200, 255) # Cyan for Top Row
+                        elif row_name == 'MID':
+                            badge_color = (120, 255, 120) # Bright Green for Home/Mid Row
+                        else:
+                            badge_color = (230, 100, 255) # Lavender/Pink for Lower Row
 
-                            if start_rel_y < -0.55:
-                                row_name = 'TOP'
-                            elif start_rel_y < -0.18:
-                                row_name = 'MID'
-                            else:
-                                row_name = 'LOW'
+                        cv2.circle(frame, (cx, cy), 14, badge_color, cv2.FILLED)
+                        cv2.putText(frame, key_name, (cx - 8, cy - 16),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-                            norm_x = (tip_pos[0] - mcp_pos[0]) / hand_scale
-                            is_stretched = False
+                        # Row label under finger
+                        cv2.putText(frame, row_name, (cx - 14, cy + 22), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, badge_color, 1)
 
-                            if hand_prefix == "L":
-                                if f_name == "INDEX":
-                                    is_stretched = (norm_x > 0.22)
-                                    if is_stretched:
-                                        curr_top, curr_mid, curr_low = "T", "G", "B"
-                                    else:
-                                        curr_top, curr_mid, curr_low = "R", "F", "V"
-                            else:
-                                if f_name == "INDEX":
-                                    is_stretched = (norm_x < -0.22)
-                                    if is_stretched:
-                                        curr_top, curr_mid, curr_low = "Y", "H", "N"
-                                    else:
-                                        curr_top, curr_mid, curr_low = "U", "J", "M"
-                                elif f_name == "MIDDLE":
-                                    curr_top, curr_mid, curr_low = "I", "K", ","
-                                elif f_name == "RING":
-                                    curr_top, curr_mid, curr_low = "O", "L", "."
-                                elif f_name == "PINKY":
-                                    curr_top, curr_mid, curr_low = "P", ";", "/"
+                        # Show stretch guide text on Index finger
+                        if f_name == "INDEX" and is_stretched:
+                            cv2.putText(frame, "STRETCH", (cx - 25, cy + 34), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 0), 1)
 
-                            if row_name == 'TOP':
-                                key_name = curr_top
-                            elif row_name == 'MID':
-                                key_name = curr_mid
-                            else:
-                                key_name = curr_low
+            self.finger_status = current_status
 
-                            tap_state_id = f"TAP_{f_id}"
-                            is_active_now = False
-
-                            if row_name == 'LOW':
-                                min_impulse, min_delta = 0.70, 0.011
-                            elif row_name == 'MID':
-                                min_impulse, min_delta = 0.70, 0.011
-                            else:
-                                min_impulse, min_delta = 0.75, 0.012
-
-                            if strike_impulse > min_impulse and delta_y > min_delta:
-                                if self.finger_states[tap_state_id] == 'READY':
-                                    self.finger_states[tap_state_id] = 'STRUCK'
-                                    self.last_strike_time[tap_state_id] = now
-                                    is_active_now = True
-                                    self.trigger_action(key_name, f_id)
-
-                                    cx, cy = int(tip_pos[0] * w), int(tip_pos[1] * h)
-                                    hit_col = (0, 255, 0) if row_name == 'MID' else ((255, 200, 0) if row_name == 'TOP' else (255, 120, 255))
-                                    cv2.circle(frame, (cx, cy), 28, hit_col, cv2.FILLED)
-                                    cv2.putText(frame, f"[{key_name}]", (cx - 25, cy - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.95, hit_col, 2)
-                            elif delta_y < 0.007 or (now - self.last_strike_time[tap_state_id] > 0.18):
-                                self.finger_states[tap_state_id] = 'READY'
-                                self.peak_pre_strike_y[f_id] = rel_y
-
-                            current_status[f_id] = {
-                                'key': key_name,
-                                'top_key': curr_top,
-                                'mid_key': curr_mid,
-                                'low_key': curr_low,
-                                'row': row_name,
-                                'flex': min(1.0, max(0.0, strike_impulse / 2.0)),
-                                'active': is_active_now,
-                                'stretched': is_stretched
-                            }
-
-                            cx, cy = int(tip_pos[0] * w), int(tip_pos[1] * h)
-                            badge_color = (0, 255, 0) if is_active_now else ((255, 180, 0) if is_stretched else ((0, 200, 255) if row_name == 'TOP' else ((120, 255, 120) if row_name == 'MID' else (230, 100, 255))))
-                            cv2.circle(frame, (cx, cy), 14, badge_color, cv2.FILLED)
-                            cv2.putText(frame, key_name, (cx - 8, cy - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                            cv2.putText(frame, row_name, (cx - 14, cy + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.38, badge_color, 1)
-
-                self.finger_status = current_status
-
-                # Header info in Camera Window (Keyboard Mode)
-                cv2.rectangle(frame, (0, 0), (w, 42), (20, 20, 20), cv2.FILLED)
-                if is_enter_active:
-                    status_str = "✨ ENTER KEY ACTIVE"
-                    status_col = (200, 100, 255)
-                elif is_backspace_active:
-                    status_str = "🔴 BACKSPACE ACTIVE"
-                    status_col = (0, 0, 255)
-                else:
-                    status_str = "🟢 KEYBOARD MODE (2 Hands Active): QWERTY 3-Row Tap Active"
-                    status_col = (0, 255, 0)
-
-                cv2.putText(frame, status_str, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.38, status_col, 2)
+            # Header info in Camera Window
+            cv2.rectangle(frame, (0, 0), (w, 42), (20, 20, 20), cv2.FILLED)
+            if is_enter_active:
+                status_str = "✨ ENTER KEY ACTIVE"
+                status_col = (200, 100, 255)
+            elif is_backspace_active:
+                status_str = "🔴 BACKSPACE ACTIVE"
+                status_col = (0, 0, 255)
             else:
-                # IDLE Mode (0 hands detected)
-                cv2.rectangle(frame, (0, 0), (w, 42), (20, 20, 20), cv2.FILLED)
-                cv2.putText(frame, "🟡 IDLE (Show 1 Hand for Mouse | 2 Hands for Keyboard)", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 200, 255), 2)
+                status_str = "🟢 DYNAMIC AUTO-CALIBRATED QWERTY: Mid-Row Active | Tap to Type"
+                status_col = (0, 255, 0)
+            
+            cv2.putText(frame, status_str, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.38, status_col, 2)
 
             cv2.imshow("AI Virtual Keyboard (3-Row QWERTY Edition)", frame)
             if cv2.waitKey(1) & 0xFF == 27:
