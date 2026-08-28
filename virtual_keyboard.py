@@ -38,13 +38,32 @@ class TopRow3DDipVirtualKeyboard:
         self.thumbs_are_touching = False
         self.last_backspace_time = 0.0
 
-        # Visual Feedback & Window Movement States
+        # Visual Feedback, Window Movement & Mouse Mode States
         self.finger_status = {}
         self.last_triggered_key = ""
         self.flash_display_time = 0.0
         self.hud_visible = True
         self.drag_x = 0
         self.drag_y = 0
+
+        # Virtual Mouse States & EMA Jitter Filter
+        self.mouse_mode_active = False
+        self.dpi_speed = 5.5
+        self.prev_pinch_pt = None
+        self.is_pinching = False
+        self.smooth_mouse_dx = 0.0
+        self.smooth_mouse_dy = 0.0
+        self.mouse_alpha = 0.35
+
+        # Virtual Mouse Click & Toggle Drag States
+        self.mouse_middle_state = 'READY'
+        self.mouse_ring_state = 'READY'
+        self.pinky_thumb_state = 'READY'
+        self.drag_mode_active = False
+        self.last_middle_click_time = 0.0
+        self.middle_click_count = 0
+        self.mouse_middle_y_hist = collections.deque(maxlen=6)
+        self.mouse_ring_y_hist = collections.deque(maxlen=6)
 
         # Setup Floating HUD UI
         self.setup_ui()
@@ -58,7 +77,7 @@ class TopRow3DDipVirtualKeyboard:
     # =========================================================================
     def setup_ui(self):
         self.root = tk.Tk()
-        self.root.title("AI Virtual Keyboard (Single Active Key Edition)")
+        self.root.title("AI Virtual Keyboard & Mouse Edition")
 
         self.root.attributes("-topmost", True)
         self.root.overrideredirect(True)
@@ -84,7 +103,15 @@ class TopRow3DDipVirtualKeyboard:
         # Show/Hide Hotkey Binding (F9)
         self.root.bind_all("<F9>", lambda event: self.toggle_hud())
 
+        # Runtime DPI Control Hotkeys (F8: Decrease DPI, F10: Increase DPI)
+        self.root.bind_all("<F8>", lambda event: self.adjust_dpi(-0.5))
+        self.root.bind_all("<F10>", lambda event: self.adjust_dpi(0.5))
+
         self.update_ui_loop()
+
+    def adjust_dpi(self, delta):
+        self.dpi_speed = round(max(0.5, min(10.0, self.dpi_speed + delta)), 1)
+        print(f"[INFO] A.I. Virtual Mouse DPI set to: {self.dpi_speed}x")
 
     def start_move(self, event):
         self.drag_x = event.x
@@ -119,6 +146,37 @@ class TopRow3DDipVirtualKeyboard:
             self.root.after(50, self.update_ui_loop)
             return
 
+        # 0. Render Photorealistic / Clean Mouse HUD Pill when 1 Hand is detected (Mouse Mode)
+        if self.mouse_mode_active:
+            if self.drag_mode_active:
+                pill_bg = "#3a080c"   # Deep dark crimson background
+                pill_bdr = "#ff3344"  # Vibrant neon red outline
+                pill_txt = "#ff6677"  # Bright high-contrast red text
+                action_tag = "✊ DRAG MODE ACTIVE (SELECT/DRAG)"
+            elif (now - self.flash_display_time) < 1.2 and self.last_triggered_key:
+                pill_bg = "#1e1e2e"
+                pill_bdr = "#04a5e5"
+                pill_txt = "#89dceb"
+                action_tag = f"✨ ACTION: {self.last_triggered_key}"
+            elif self.is_pinching:
+                pill_bg = "#1e1e2e"
+                pill_bdr = "#40a02b"
+                pill_txt = "#a6e3a1"
+                action_tag = "🤏 PINCH MOVING"
+            else:
+                pill_bg = "#1e1e2e"
+                pill_bdr = "#04a5e5"
+                pill_txt = "#89dceb"
+                action_tag = "🖐 PINCH TO MOVE"
+
+            # Ultra-wide pill bounds (60 to 920 = 860px wide) so text never clips
+            self.draw_rounded_rect(60, 2, 920, 28, 12, pill_bg, pill_bdr)
+            mouse_status = f"🖱 MOUSE ACTIVE   •   DPI: {self.dpi_speed}x   •   {action_tag}   •   [F8: DPI- | F10: DPI+]"
+            self.canvas.create_text(490, 15, text=mouse_status, font=("Segoe UI", 9, "bold"), fill=pill_txt)
+
+            self.root.after(20, self.update_ui_loop)
+            return
+
         # 1. Header Drag & Control Handle Bar (Sleek Modern Pill)
         self.draw_rounded_rect(330, 2, 650, 28, 12, "#1e1e2e", "#45475a")
         self.canvas.create_text(490, 15, text="⠿ DRAG TO MOVE   •   [F9] HIDE HUD", font=("Segoe UI", 9, "bold"), fill="#cdd6f4")
@@ -134,11 +192,11 @@ class TopRow3DDipVirtualKeyboard:
             ('R_PINKY', 'R Pinky', 'P', ';', '/')
         ]
 
-        start_x = 35
-        box_w = 98
-        gap = 18
-        box_h = 75
-        start_y = 38
+        start_x = 42
+        box_w = 78
+        gap = 36
+        box_h = 60
+        start_y = 40
 
         for idx, (f_id, f_label, def_top, def_mid, def_low) in enumerate(finger_columns):
             x = start_x + idx * (box_w + gap)
@@ -160,7 +218,7 @@ class TopRow3DDipVirtualKeyboard:
             is_key_flashing = is_flashing and (self.last_triggered_key == active_key)
 
             # Dip bounce animation on strike
-            f_dip = 10 if is_active else 0
+            f_dip = 8 if is_active else 0
             by1 = start_y + f_dip
             by2 = by1 + box_h
             bx1 = x
@@ -179,16 +237,16 @@ class TopRow3DDipVirtualKeyboard:
             else:  # LOW
                 bg_col, txt_col, bdr_col = "", "#b4befe", "#7287fd"  # 100% Transparent Lavender Low
 
-            # 1. Single Active Key Box (100% Transparent Inside Fill)
-            self.draw_rounded_rect(bx1, by1, bx2, by2, 12, bg_col, bdr_col)
+            # 1. Compact Active Key Box (100% Transparent Inside Fill)
+            self.draw_rounded_rect(bx1, by1, bx2, by2, 10, bg_col, bdr_col)
 
-            # High contrast glowing text
-            self.canvas.create_text(cx, by1 + 28, text=active_key, font=("Segoe UI", 24, "bold"), fill=txt_col)
+            # High contrast glowing text (18pt)
+            self.canvas.create_text(cx, by1 + 22, text=active_key, font=("Segoe UI", 18, "bold"), fill=txt_col)
 
             # 2. Row Tag & Finger Label
             row_tag = f"[{active_row}]" if not is_stretched else "[STRETCH]"
-            self.canvas.create_text(cx, by1 + 58, text=row_tag, font=("Segoe UI", 8, "bold"), fill=txt_col)
-            self.canvas.create_text(cx, by2 + 16, text=f_label, font=("Segoe UI", 9, "bold"), fill="#cdd6f4")
+            self.canvas.create_text(cx, by1 + 45, text=row_tag, font=("Segoe UI", 7, "bold"), fill=txt_col)
+            self.canvas.create_text(cx, by2 + 14, text=f_label, font=("Segoe UI", 8, "bold"), fill="#cdd6f4")
 
         if is_flashing:
             if self.last_triggered_key == 'ENTER':
@@ -377,6 +435,7 @@ class TopRow3DDipVirtualKeyboard:
             h, w, _ = frame.shape
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = hands.process(rgb_frame)
+            now = time.time()
 
             current_status = {}
             assigned_hands = {}
@@ -405,6 +464,174 @@ class TopRow3DDipVirtualKeyboard:
             if assigned_hands:
                 scales = [max(0.08, self.dist(h_data[1][0], h_data[1][9])) for h_data in assigned_hands.values()]
                 ref_hand_scale = sum(scales) / len(scales)
+
+            # -----------------------------------------------------------------
+            # A.I. VIRTUAL MOUSE PIPELINE (Active ONLY when 1 Hand is Visible)
+            # -----------------------------------------------------------------
+            if len(assigned_hands) == 1:
+                self.mouse_mode_active = True
+                single_hand_data = list(assigned_hands.values())[0]
+                smooth_lms = single_hand_data[1]
+
+                thumb_tip = smooth_lms[4]
+                index_tip = smooth_lms[8]
+                pinch_dist = self.dist(thumb_tip, index_tip) / ref_hand_scale
+                
+                # Pinch-to-Move (Relative physical mouse behavior with zero jump)
+                if pinch_dist < 0.14:
+                    raw_x = (thumb_tip[0] + index_tip[0]) / 2
+                    raw_y = (thumb_tip[1] + index_tip[1]) / 2
+
+                    if not self.is_pinching:
+                        # 1. ANCHOR FRAME: Initialize anchor position when pinch begins (ZERO MOUSE JUMP)
+                        self.is_pinching = True
+                        self.prev_pinch_pt = (raw_x, raw_y)
+                        self.smooth_mouse_dx = 0.0
+                        self.smooth_mouse_dy = 0.0
+                    else:
+                        # 2. PINCH DRAG: Pure relative delta from previous pinched frame
+                        if self.prev_pinch_pt is not None:
+                            raw_dx = (raw_x - self.prev_pinch_pt[0]) * 1600.0 * (self.dpi_speed / 2.5)
+                            raw_dy = (raw_y - self.prev_pinch_pt[1]) * 1600.0 * (self.dpi_speed / 2.5)
+
+                            # Smooth relative delta
+                            self.smooth_mouse_dx = self.smooth_mouse_dx * (1 - self.mouse_alpha) + raw_dx * self.mouse_alpha
+                            self.smooth_mouse_dy = self.smooth_mouse_dy * (1 - self.mouse_alpha) + raw_dy * self.mouse_alpha
+
+                            if abs(self.smooth_mouse_dx) > 0.8 or abs(self.smooth_mouse_dy) > 0.8:
+                                pyautogui.moveRel(int(self.smooth_mouse_dx), int(self.smooth_mouse_dy), _pause=False)
+
+                        self.prev_pinch_pt = (raw_x, raw_y)
+
+                    # Visual feedback on camera preview
+                    cx, cy = int(raw_x * w), int(raw_y * h)
+                    cv2.circle(frame, (cx, cy), 18, (0, 255, 0), cv2.FILLED)
+                    cv2.putText(frame, f"MOUSE PINCH [{self.dpi_speed}x]", (cx - 65, cy - 22), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+                else:
+                    self.is_pinching = False
+                    self.prev_pinch_pt = None
+                    self.smooth_mouse_dx = 0.0
+                    self.smooth_mouse_dy = 0.0
+                # -------------------------------------------------------------
+                # 1. TOGGLE DRAG-AND-DROP MODE (Pinky + Thumb Touch)
+                # -------------------------------------------------------------
+                pinky_tip_pt = smooth_lms[20]
+                pinky_thumb_dist = self.dist(thumb_tip, pinky_tip_pt) / ref_hand_scale
+
+                if pinky_thumb_dist < 0.14 and self.pinky_thumb_state == 'READY':
+                    self.pinky_thumb_state = 'TOUCHED'
+                    self.drag_mode_active = not self.drag_mode_active
+
+                    if self.drag_mode_active:
+                        pyautogui.mouseDown()
+                        self.flash_display_time = now
+                        self.last_triggered_key = "DRAG MODE ON (SELECTING)"
+                        threading.Thread(target=lambda: winsound.Beep(1600, 45), daemon=True).start()
+                        print("[INFO] TOGGLE DRAG MODE: ON (MouseDown)")
+                    else:
+                        pyautogui.mouseUp()
+                        self.flash_display_time = now
+                        self.last_triggered_key = "DRAG MODE OFF (RELEASED)"
+                        threading.Thread(target=lambda: winsound.Beep(1000, 45), daemon=True).start()
+                        print("[INFO] TOGGLE DRAG MODE: OFF (MouseUp)")
+                elif pinky_thumb_dist >= 0.18:
+                    self.pinky_thumb_state = 'READY'
+
+                # Visual overlay feedback for Toggle Drag Mode
+                if self.drag_mode_active:
+                    cv2.putText(frame, "[DRAG MODE ON - SELECTING]", (15, h - 25), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 0), 2)
+
+                # -------------------------------------------------------------
+                # 2. VIRTUAL MOUSE CLICK GESTURES (Disabled during Drag Mode):
+                #    - Middle Finger Dip -> 1x Left Click / 2x Double Click / 3x Triple Click
+                #    - Ring Finger Dip -> Right Click
+                # -------------------------------------------------------------
+                if not self.drag_mode_active:
+                    middle_tip_pt = smooth_lms[12]
+                    middle_mcp_pt = smooth_lms[9]
+                    ring_tip_pt = smooth_lms[16]
+                    ring_mcp_pt = smooth_lms[13]
+
+                    mid_rel_y = (middle_tip_pt[1] - middle_mcp_pt[1]) / ref_hand_scale
+                    rng_rel_y = (ring_tip_pt[1] - ring_mcp_pt[1]) / ref_hand_scale
+
+                    self.mouse_middle_y_hist.append((mid_rel_y, now))
+                    self.mouse_ring_y_hist.append((rng_rel_y, now))
+
+                    # Evaluate Middle Finger Multi-Tap (1x Left, 2x Double, 3x Triple Click)
+                    m_vel, m_dy = 0.0, 0.0
+                    if len(self.mouse_middle_y_hist) >= 3:
+                        m_dt = self.mouse_middle_y_hist[-1][1] - self.mouse_middle_y_hist[0][1]
+                        m_dy = self.mouse_middle_y_hist[-1][0] - self.mouse_middle_y_hist[0][0]
+                        m_vel = (m_dy / m_dt) if m_dt > 0.001 else 0.0
+
+                    if m_vel > 0.88 and m_dy > 0.018 and self.mouse_middle_state == 'READY':
+                        self.mouse_middle_state = 'DIPPED'
+                        cx, cy = int(middle_tip_pt[0] * w), int(middle_tip_pt[1] * h)
+
+                        # Track Multi-Tap interval (< 0.38s)
+                        if (now - self.last_middle_click_time) < 0.38:
+                            self.middle_click_count += 1
+                        else:
+                            self.middle_click_count = 1
+
+                        self.last_middle_click_time = now
+                        self.flash_display_time = now
+
+                        if self.middle_click_count == 1:
+                            pyautogui.click()
+                            self.last_triggered_key = "LEFT CLICK"
+                            cv2.circle(frame, (cx, cy), 24, (0, 255, 0), cv2.FILLED)
+                            cv2.putText(frame, "LEFT CLICK", (cx - 40, cy - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+                            threading.Thread(target=lambda: winsound.Beep(1800, 35), daemon=True).start()
+                        elif self.middle_click_count == 2:
+                            pyautogui.click(clicks=2)
+                            self.last_triggered_key = "DOUBLE CLICK"
+                            cv2.circle(frame, (cx, cy), 24, (255, 255, 0), cv2.FILLED)
+                            cv2.putText(frame, "DOUBLE CLICK", (cx - 50, cy - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 0), 2)
+                            threading.Thread(target=lambda: winsound.Beep(2000, 35), daemon=True).start()
+                        elif self.middle_click_count >= 3:
+                            pyautogui.click(clicks=3)
+                            self.last_triggered_key = "TRIPLE CLICK"
+                            self.middle_click_count = 0  # Reset after triple click
+                            cv2.circle(frame, (cx, cy), 24, (0, 255, 255), cv2.FILLED)
+                            cv2.putText(frame, "TRIPLE CLICK", (cx - 50, cy - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
+                            threading.Thread(target=lambda: winsound.Beep(2200, 45), daemon=True).start()
+                    elif m_vel < 0.25 or m_dy < 0.005 or (now - self.last_middle_click_time > 0.25):
+                        self.mouse_middle_state = 'READY'
+
+                # Evaluate Ring Finger Dip (Right Click)
+                r_vel, r_dy = 0.0, 0.0
+                if len(self.mouse_ring_y_hist) >= 3:
+                    r_dt = self.mouse_ring_y_hist[-1][1] - self.mouse_ring_y_hist[0][1]
+                    r_dy = self.mouse_ring_y_hist[-1][0] - self.mouse_ring_y_hist[0][0]
+                    r_vel = (r_dy / r_dt) if r_dt > 0.001 else 0.0
+
+                if r_vel > 0.88 and r_dy > 0.018 and self.mouse_ring_state == 'READY':
+                    self.mouse_ring_state = 'DIPPED'
+                    pyautogui.rightClick()
+                    self.flash_display_time = now
+                    self.last_triggered_key = "RIGHT CLICK"
+
+                    cx, cy = int(ring_tip_pt[0] * w), int(ring_tip_pt[1] * h)
+                    cv2.circle(frame, (cx, cy), 24, (255, 0, 255), cv2.FILLED)
+                    cv2.putText(frame, "RIGHT CLICK", (cx - 45, cy - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 0, 255), 2)
+                    threading.Thread(target=lambda: winsound.Beep(1400, 40), daemon=True).start()
+                elif r_vel < 0.25 or r_dy < 0.005 or (now - self.flash_display_time > 0.25):
+                    self.mouse_ring_state = 'READY'
+            else:
+                # Disable Mouse Mode when 2 hands (or 0 hands) are present -> Enable Keyboard Typing Mode
+                if self.drag_mode_active:
+                    pyautogui.mouseUp()
+                    self.drag_mode_active = False
+
+                self.mouse_mode_active = False
+                self.is_pinching = False
+                self.prev_pinch_pt = None
+                self.smooth_mouse_dx = 0.0
+                self.smooth_mouse_dy = 0.0
 
             # -----------------------------------------------------------------
             # GESTURE 1: SPACE (Both index Touch -> Enter)
@@ -458,10 +685,18 @@ class TopRow3DDipVirtualKeyboard:
                     else:
                         self.thumbs_are_touching = False
 
+            # Render hand landmarks connections on camera frame
+            if self.mouse_mode_active:
+                for hand_label, (mean_x, smooth_lms, raw_lms) in assigned_hands.items():
+                    mp_draw.draw_landmarks(frame, raw_lms, mp_hands.HAND_CONNECTIONS)
+                    wrist_pt = smooth_lms[0]
+                    cv2.putText(frame, "[MOUSE MODE ACTIVE]", (int(wrist_pt[0]*w) - 65, int(wrist_pt[1]*h) + 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 200, 0), 2)
+
             # -----------------------------------------------------------------
-            # CORE MATRIX: DYNAMIC TAP IMPULSE (VELOCITY STRIKE) ENGINE
+            # CORE MATRIX: DYNAMIC TAP IMPULSE (VELOCITY STRIKE) ENGINE (Keyboard Mode Only)
             # -----------------------------------------------------------------
-            if not is_enter_active and not is_backspace_active:
+            if not self.mouse_mode_active and not is_enter_active and not is_backspace_active:
                 for hand_label, (mean_x, smooth_lms, raw_lms) in assigned_hands.items():
                     mp_draw.draw_landmarks(frame, raw_lms, mp_hands.HAND_CONNECTIONS)
                     hand_prefix = 'L' if hand_label == "Left" else 'R'
@@ -629,9 +864,9 @@ class TopRow3DDipVirtualKeyboard:
                                 else:
                                     hit_col = (255, 120, 255)
 
-                                cv2.circle(frame, (cx, cy), 28, hit_col, cv2.FILLED)
-                                cv2.putText(frame, f"[{key_name}]", (cx - 25, cy - 25), 
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.95, hit_col, 2)
+                                cv2.circle(frame, (cx, cy), 16, hit_col, cv2.FILLED)
+                                cv2.putText(frame, f"[{key_name}]", (cx - 16, cy - 16), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, hit_col, 2)
                         elif delta_y < 0.007 or (now - self.last_strike_time[tap_state_id] > 0.18):
                             self.finger_states[tap_state_id] = 'READY'
                             self.peak_pre_strike_y[f_id] = rel_y
@@ -647,7 +882,7 @@ class TopRow3DDipVirtualKeyboard:
                             'stretched': is_stretched
                         }
 
-                        # Draw Finger Badge & Row Tag on Camera
+                        # Draw Compact Sleek Finger Badge & Row Tag on Camera
                         cx, cy = int(tip_pos[0] * w), int(tip_pos[1] * h)
                         if is_active_now:
                             badge_color = (0, 255, 0)
@@ -660,18 +895,19 @@ class TopRow3DDipVirtualKeyboard:
                         else:
                             badge_color = (230, 100, 255) # Lavender/Pink for Lower Row
 
-                        cv2.circle(frame, (cx, cy), 14, badge_color, cv2.FILLED)
-                        cv2.putText(frame, key_name, (cx - 8, cy - 16),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                        # Sleek small 8px circle badge
+                        cv2.circle(frame, (cx, cy), 8, badge_color, cv2.FILLED)
+                        cv2.putText(frame, key_name, (cx - 5, cy - 11),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
 
-                        # Row label under finger
-                        cv2.putText(frame, row_name, (cx - 14, cy + 22), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, badge_color, 1)
+                        # Compact row label under finger
+                        cv2.putText(frame, row_name, (cx - 10, cy + 15), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, badge_color, 1)
 
                         # Show stretch guide text on Index finger
                         if f_name == "INDEX" and is_stretched:
-                            cv2.putText(frame, "STRETCH", (cx - 25, cy + 34), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 0), 1)
+                            cv2.putText(frame, "STRETCH", (cx - 18, cy + 26), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 200, 0), 1)
 
             self.finger_status = current_status
 
