@@ -4,7 +4,7 @@ __pycache__/
 /visuals_data
 **/tempCodeRunnerFile.py
 /.vscode/
-desktop.ini
+# desktop.ini
 # frontend/build/
 # Environment Variables
 config.env
@@ -22,7 +22,7 @@ env/
 .pytest_cache/
 
 # System Files
-desktop.ini
+# desktop.ini
 Thumbs.db
 .DS_Store
 .AppleDouble
