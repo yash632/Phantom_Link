@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import time
 import math
 import subprocess
@@ -18,7 +19,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QGridLayout, QSlider, QScrollArea
 )
 from PyQt6.QtGui import (
-    QColor, QFont, QIcon, QPixmap, QMouseEvent, QPainter, QPen, QBrush,
+    QColor, QFont, QIcon, QPixmap, QImage, QMouseEvent, QPainter, QPen, QBrush,
     QPainterPath, QLinearGradient, QRadialGradient
 )
 
@@ -45,14 +46,12 @@ VK_VOLUME_UP = 0xAF
 
 class CenterVisualizerWidget(QWidget):
     """
-    100% Pixel-Accurate Cyberpunk Glass Orb Visualizer (Matching assets/ui.png 1-to-1).
-    Features:
-    - Deep Translucent Dark Sapphire Glass Sphere with Crisp Neon Cyan Rim
-    - Glowing Horizontal Cyberpunk Bezier S-Wave (Cyan to Purple Gradient)
-    - Thin Outer & Inner Orbit Rings (R = 135, R = 112)
-    - Interactive Clickable Glass Mic Button (Toggles Voice Mute/Unmute!)
-    - 19-Bar Dynamic Animated Audio Spectrum Waveform
-    - Zero Text/Wave Overlap Guarantee!
+    Center Visualizer Widget with Animated 192-Frame Video Globe Loop.
+    Loads and continuously loops frame1.png through frame192.png from glob directory.
+    Includes:
+    - 30 FPS video-smooth frame sequence loop (frame1.png to frame192.png)
+    - Synchronized Equalizer & Listening Status
+    - Interactive Clickable Glass Mic Button
     """
     mic_toggled = pyqtSignal(bool)
 
@@ -60,30 +59,99 @@ class CenterVisualizerWidget(QWidget):
         super().__init__(parent)
         self.anim_frame = 0
         self.is_listening = True
-        self.setMinimumSize(340, 480)
+        self.setMinimumSize(340, 520)
 
-        # 30 FPS smooth wave animation timer
+        self.frames = []
+        self.current_frame_idx = 0
+        self.frames_loaded = False
+
+        # Find glob directory
+        self.glob_dir = self._find_glob_dir()
+
+        # Load first frame immediately for 0ms initial render
+        self._load_first_frame()
+
+        # Asynchronously cache all 192 frames in background
+        threading.Thread(target=self._load_all_frames_async, daemon=True).start()
+
+        # 30 FPS smooth video animation loop timer (33ms)
         self.timer = QTimer(self)
         self.timer.setInterval(33)
         self.timer.timeout.connect(self._update_anim)
         self.timer.start()
 
+    def _find_glob_dir(self):
+        candidates = [
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "glob")),
+            r"D:\Development\Phantom_Link\glob",
+            r"D:\Development\Virtual IO\glob",
+            os.path.abspath("glob"),
+        ]
+        for c in candidates:
+            if os.path.exists(c) and os.path.isdir(c):
+                return c
+        return None
+
+    def _load_first_frame(self):
+        if not self.glob_dir:
+            return
+        first_path = os.path.join(self.glob_dir, "frame1.png")
+        if os.path.exists(first_path):
+            img = QImage(first_path)
+            if not img.isNull():
+                scaled = img.scaledToHeight(240, Qt.TransformationMode.SmoothTransformation)
+                self.frames.append(scaled)
+
+    def _load_all_frames_async(self):
+        if not self.glob_dir:
+            return
+        try:
+            files = [f for f in os.listdir(self.glob_dir) if f.lower().endswith(('.png', '.jpg'))]
+            def _num_key(name):
+                nums = re.findall(r'\d+', name)
+                return int(nums[0]) if nums else 0
+            files = sorted(files, key=_num_key)
+
+            loaded = []
+            for f in files:
+                f_path = os.path.join(self.glob_dir, f)
+                img = QImage(f_path)
+                if not img.isNull():
+                    scaled = img.scaledToHeight(240, Qt.TransformationMode.SmoothTransformation)
+                    loaded.append(scaled)
+                    # Progressively update frames so rotation starts playing immediately!
+                    if len(loaded) % 15 == 0:
+                        self.frames = list(loaded)
+
+            if loaded:
+                self.frames = loaded
+                self.frames_loaded = True
+                print(f"[PHANTOM GUI]: Successfully cached all {len(loaded)} video globe frames for 30 FPS looping!")
+        except Exception as e:
+            print(f"[PHANTOM GUI NOTICE] Glob frames load notice: {e}")
+
     def _update_anim(self):
-        if self.is_listening:
-            self.anim_frame += 1
+        if self.frames:
+            if self.is_listening:
+                self.current_frame_idx = (self.current_frame_idx + 1) % len(self.frames)
+            else:
+                # Gentle half-speed rotation when muted
+                if self.anim_frame % 2 == 0:
+                    self.current_frame_idx = (self.current_frame_idx + 1) % len(self.frames)
+        self.anim_frame += 1
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent):
         cx = self.width() / 2.0
-        cy = 125.0
-        orb_r = 82.0
-        txt_y = cy + orb_r + 35
-        eq_y = txt_y + 40
-        mic_y = eq_y + 55
+        cy = 135.0
+        orb_visual_r = 115.0
+        txt_y = cy + orb_visual_r + 20
+        eq_y = txt_y + 35
+        mic_y = eq_y + 50
 
         click_pos = event.position()
         dist_sq = (click_pos.x() - cx) ** 2 + (click_pos.y() - mic_y) ** 2
-        if dist_sq <= 32 ** 2:
+        if dist_sq <= 30 ** 2:
             self.is_listening = not self.is_listening
             self.mic_toggled.emit(self.is_listening)
             print(f"[PHANTOM MIC TOGGLE]: Mic Listening -> {self.is_listening}")
@@ -91,111 +159,37 @@ class CenterVisualizerWidget(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
         cx = self.width() / 2.0
-        cy = 125.0  # Center of orb
+        cy = 135.0  # Center of video globe
 
-        # 1. Outer Thin Orbit Ring (R = 135)
-        pen_outer = QPen(QColor(56, 189, 248, 80 if self.is_listening else 40), 1.2)
-        painter.setPen(pen_outer)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawEllipse(QPoint(int(cx), int(cy)), 135, 135)
+        # 1. Draw Looping Video Globe Frame
+        if self.frames:
+            idx = min(self.current_frame_idx, len(self.frames) - 1)
+            img = self.frames[idx]
+            pw = img.width()
+            ph = img.height()
+            target_x = int(cx - (pw / 2.0))
+            target_y = int(cy - (ph / 2.0))
 
-        # 2. Middle Thin Orbit Ring (R = 112)
-        pen_mid = QPen(QColor(129, 140, 248, 110 if self.is_listening else 50), 1.2)
-        painter.setPen(pen_mid)
-        painter.drawEllipse(QPoint(int(cx), int(cy)), 112, 112)
+            if not self.is_listening:
+                painter.setOpacity(0.55)
 
-        # 3. DEEP DARK SAPPHIRE GLASS SPHERE ORB (R = 82) (Matching assets/ui.png 1-to-1)
-        orb_r = 82.0
-        orb_rect = QRectF(cx - orb_r, cy - orb_r, orb_r * 2, orb_r * 2)
+            painter.drawImage(target_x, target_y, img)
 
-        # Deep Sapphire Translucent Glass Radial Gradient Fill
-        grad_sphere = QRadialGradient(cx - 15, cy - 20, orb_r)
-        if self.is_listening:
-            grad_sphere.setColorAt(0.00, QColor(19, 28, 49, 240))  # Deep Sapphire Core
-            grad_sphere.setColorAt(0.65, QColor(9, 14, 26, 250))
-            grad_sphere.setColorAt(1.00, QColor(5, 8, 16, 255))
+            if not self.is_listening:
+                painter.setOpacity(1.0)
         else:
-            grad_sphere.setColorAt(0.00, QColor(35, 15, 20, 240))
-            grad_sphere.setColorAt(0.65, QColor(18, 8, 10, 250))
-            grad_sphere.setColorAt(1.00, QColor(10, 5, 5, 255))
+            # Fallback in case frames are still initializing
+            painter.setPen(QPen(QColor(56, 189, 248, 120), 2.0))
+            painter.setBrush(QColor(15, 23, 42, 220))
+            painter.drawEllipse(QPoint(int(cx), int(cy)), 90, 90)
 
-        painter.setBrush(QBrush(grad_sphere))
-        pen_orb = QPen(QColor(56, 189, 248, 220) if self.is_listening else QColor(239, 68, 68, 200), 2.2)
-        painter.setPen(pen_orb)
-        painter.drawEllipse(orb_rect)
-
-        # 4. GLOWING CYBERPUNK BEZIER S-WAVE (Matching assets/ui.png 1-to-1)
-        phase = self.anim_frame * 0.08
-        start_x = cx - orb_r + 6
-        start_y = cy + math.sin(phase) * 6
-        end_x = cx + orb_r - 6
-        end_y = cy - math.sin(phase) * 6
-
-        cp1_x = cx - 30
-        cp1_y = cy - 36 + math.sin(phase) * 16
-        cp2_x = cx + 30
-        cp2_y = cy + 36 - math.sin(phase) * 16
-
-        wave_path = QPainterPath()
-        wave_path.moveTo(start_x, start_y)
-        wave_path.cubicTo(cp1_x, cp1_y, cp2_x, cp2_y, end_x, end_y)
-
-        # Outer Wave Glow (12px width)
-        grad_glow = QLinearGradient(cx - orb_r, cy, cx + orb_r, cy)
-        if self.is_listening:
-            grad_glow.setColorAt(0.0, QColor(0, 229, 255, 130))
-            grad_glow.setColorAt(0.5, QColor(168, 85, 247, 130))
-            grad_glow.setColorAt(1.0, QColor(0, 229, 255, 130))
-        else:
-            grad_glow.setColorAt(0.0, QColor(239, 68, 68, 120))
-            grad_glow.setColorAt(1.0, QColor(239, 68, 68, 120))
-
-        painter.setPen(QPen(QBrush(grad_glow), 12.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        painter.drawPath(wave_path)
-
-        # Core Wave Ribbon (5.5px width)
-        grad_wave_core = QLinearGradient(cx - orb_r, cy, cx + orb_r, cy)
-        if self.is_listening:
-            grad_wave_core.setColorAt(0.0, QColor(56, 189, 248, 255))
-            grad_wave_core.setColorAt(0.5, QColor(192, 132, 252, 255))
-            grad_wave_core.setColorAt(1.0, QColor(56, 189, 248, 255))
-        else:
-            grad_wave_core.setColorAt(0.0, QColor(248, 113, 113, 240))
-            grad_wave_core.setColorAt(1.0, QColor(239, 68, 68, 240))
-
-        painter.setPen(QPen(QBrush(grad_wave_core), 5.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        painter.drawPath(wave_path)
-
-        # White-Hot Center Highlight Line (2.0px width)
-        painter.setPen(QPen(QColor(255, 255, 255, 240), 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        painter.drawPath(wave_path)
-
-        # Ambient Arc Accents & Floating Data Dots inside Sphere (ui.png aesthetic)
-        swirl_top = QPainterPath()
-        swirl_top.moveTo(cx - 45, cy - 32)
-        swirl_top.cubicTo(cx - 15, cy - 58 + math.sin(phase) * 4, cx + 30, cy - 52, cx + 55, cy - 22)
-        painter.setPen(QPen(QColor(56, 189, 248, 80 if self.is_listening else 30), 1.5))
-        painter.drawPath(swirl_top)
-
-        swirl_bot = QPainterPath()
-        swirl_bot.moveTo(cx - 55, cy + 22)
-        swirl_bot.cubicTo(cx - 30, cy + 52, cx + 15, cy + 58 - math.sin(phase) * 4, cx + 45, cy + 32)
-        painter.setPen(QPen(QColor(168, 85, 247, 80 if self.is_listening else 30), 1.5))
-        painter.drawPath(swirl_bot)
-
-        if self.is_listening:
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(255, 255, 255, 220))
-            dots = [(cx - 35, cy - 20), (cx + 40, cy + 18), (cx - 15, cy + 38), (cx + 25, cy - 35)]
-            for i, (dx, dy) in enumerate(dots):
-                d_off = math.sin(phase * 1.5 + i) * 3
-                painter.drawEllipse(QPoint(int(dx + d_off), int(dy)), 2, 2)
-
-        # 5. Status Text: L I S T E N I N G . . . vs M U T E D
+        # 2. Status Text: L I S T E N I N G . . . vs M U T E D
+        orb_visual_r = 115.0
+        txt_y = int(cy + orb_visual_r + 20)
         painter.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        txt_y = int(cy + orb_r + 35)
         if self.is_listening:
             painter.setPen(QColor(255, 255, 255))
             painter.drawText(QRectF(cx - 150, txt_y, 300, 25), Qt.AlignmentFlag.AlignCenter, "L I S T E N I N G . . .")
@@ -203,8 +197,8 @@ class CenterVisualizerWidget(QWidget):
             painter.setPen(QColor(239, 68, 68))
             painter.drawText(QRectF(cx - 150, txt_y, 300, 25), Qt.AlignmentFlag.AlignCenter, "M U T E D   ( P A U S E D )")
 
-        # 6. 19-Bar Animated Audio Equalizer Spectrum Waveform
-        eq_y = txt_y + 40
+        # 3. 19-Bar Animated Audio Equalizer Spectrum Waveform
+        eq_y = txt_y + 35
         bar_count = 19
         base_heights = [4, 6, 9, 13, 18, 24, 30, 36, 42, 46, 42, 36, 30, 24, 18, 13, 9, 6, 4]
         bar_width = 3.5
@@ -218,6 +212,7 @@ class CenterVisualizerWidget(QWidget):
         painter.drawEllipse(QPoint(int(eq_start_x - 12), eq_y), 2, 2)
         painter.drawEllipse(QPoint(int(eq_start_x - 4), eq_y), 2, 2)
 
+        phase = self.anim_frame * 0.08
         for i in range(bar_count):
             h_anim = (base_heights[i] + math.sin(phase * 2.0 + i * 0.4) * 8.0) if self.is_listening else 4.0
             h_anim = max(3.0, h_anim)
@@ -245,10 +240,10 @@ class CenterVisualizerWidget(QWidget):
         painter.drawEllipse(QPoint(int(eq_end_x + 12), eq_y), 2, 2)
         painter.drawEllipse(QPoint(int(eq_end_x + 20), eq_y), 2, 2)
 
-        # 7. Double-Ringed Circular Glass Mic Badge Button
-        mic_y = eq_y + 55
-        mic_outer_r = 30.0
-        mic_inner_r = 24.0
+        # 4. Double-Ringed Circular Glass Mic Badge Button
+        mic_y = eq_y + 50
+        mic_outer_r = 28.0
+        mic_inner_r = 22.0
 
         painter.setPen(QPen(QColor(56, 189, 248, 120) if self.is_listening else QColor(239, 68, 68, 120), 1.2))
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -260,12 +255,12 @@ class CenterVisualizerWidget(QWidget):
 
         painter.setPen(QPen(QColor(255, 255, 255) if self.is_listening else QColor(239, 68, 68), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         painter.setBrush(QColor(255, 255, 255) if self.is_listening else QColor(239, 68, 68))
-        painter.drawRoundedRect(QRectF(cx - 4, mic_y - 10, 8, 13), 4, 4)
+        painter.drawRoundedRect(QRectF(cx - 4, mic_y - 9, 8, 12), 4, 4)
 
         painter.setBrush(Qt.BrushStyle.NoBrush)
         stand_path = QPainterPath()
-        stand_path.arcMoveTo(QRectF(cx - 7, mic_y - 6, 14, 13), 0)
-        stand_path.arcTo(QRectF(cx - 7, mic_y - 6, 14, 13), 0, -180)
+        stand_path.arcMoveTo(QRectF(cx - 7, mic_y - 5, 14, 12), 0)
+        stand_path.arcTo(QRectF(cx - 7, mic_y - 5, 14, 12), 0, -180)
         painter.drawPath(stand_path)
 
         painter.drawLine(int(cx), int(mic_y + 7), int(cx), int(mic_y + 11))
@@ -273,25 +268,28 @@ class CenterVisualizerWidget(QWidget):
 
         if not self.is_listening:
             painter.setPen(QPen(QColor(239, 68, 68), 3.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            painter.drawLine(int(cx - 12), int(mic_y - 12), int(cx + 12), int(mic_y + 12))
+            painter.drawLine(int(cx - 11), int(mic_y - 11), int(cx + 11), int(mic_y + 11))
 
 
 class PhantomGUI(QMainWindow):
     """
     100% Fully Functional Cyberpunk Glassmorphism Dashboard GUI for PHANTOM (assets/ui.png).
-    Features:
-    - 100% Pixel-Accurate Cyberpunk Dark Sapphire Glass Orb (assets/ui.png)
-    - Synchronized Play/Pause Button Toggle (▶ vs ⏸)
-    - Real-Time Windows Media & Active Browser Track Fetcher
-    - Real-Time Hardware Resource Monitoring
-    - Live Terminal Log Console
     """
-    def __init__(self, on_command_trigger=None, tts_engine=None):
+    sig_log = pyqtSignal(str, str)
+    sig_processing = pyqtSignal(bool, str)
+    sig_vk_button = pyqtSignal()
+
+    def __init__(self, on_command_trigger=None, tts_engine=None, vk_controller=None):
         super().__init__()
         self.on_command_trigger = on_command_trigger
         self.tts_engine = tts_engine
+        self.vk_controller = vk_controller
         self.drag_position = QPoint()
         self.is_media_playing = False
+
+        self.sig_log.connect(self._handle_log)
+        self.sig_processing.connect(self._handle_processing)
+        self.sig_vk_button.connect(self._update_vk_button_state)
 
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -418,7 +416,7 @@ class PhantomGUI(QMainWindow):
         layout = QHBoxLayout(title_frame)
         layout.setContentsMargins(10, 0, 10, 0)
 
-        self.status_dot = QLabel("ili.  Voice Active  ●")
+        self.status_dot = QLabel("Voice Active")
         self.status_dot.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         self.status_dot.setStyleSheet("""
             color: #38bdf8;
@@ -458,8 +456,8 @@ class PhantomGUI(QMainWindow):
         c_layout.setContentsMargins(12, 4, 12, 4)
         c_layout.setSpacing(14)
 
-        wave_icon = QLabel("ili.")
-        wave_icon.setStyleSheet("color: #38bdf8; font-weight: bold; border: none; background: transparent;")
+        # wave_icon = QLabel("ili.")
+        # wave_icon.setStyleSheet("color: #38bdf8; font-weight: bold; border: none; background: transparent;")
 
         btn_min = QPushButton("—")
         btn_min.setFixedSize(22, 22)
@@ -470,7 +468,7 @@ class PhantomGUI(QMainWindow):
         """)
         btn_min.clicked.connect(self.showMinimized)
 
-        btn_max = QPushButton("□")
+        btn_max = QPushButton("☐")
         btn_max.setFixedSize(22, 22)
         btn_max.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_max.setStyleSheet("""
@@ -488,7 +486,7 @@ class PhantomGUI(QMainWindow):
         """)
         btn_close.clicked.connect(self.close)
 
-        c_layout.addWidget(wave_icon)
+        # c_layout.addWidget(wave_icon)
         c_layout.addWidget(btn_min)
         c_layout.addWidget(btn_max)
         c_layout.addWidget(btn_close)
@@ -509,7 +507,7 @@ class PhantomGUI(QMainWindow):
 
     def _handle_mic_toggle(self, is_listening):
         if is_listening:
-            self.status_dot.setText("ili.  Voice Active  ●")
+            self.status_dot.setText("Voice Active")
             self.status_dot.setStyleSheet("""
                 color: #38bdf8;
                 background: rgba(15, 23, 42, 0.65);
@@ -756,10 +754,63 @@ class PhantomGUI(QMainWindow):
         page = QFrame()
         page.setStyleSheet("background: rgba(15, 23, 42, 0.45); border: 1px solid rgba(56, 189, 248, 0.22); border-radius: 20px; padding: 20px;")
         layout = QVBoxLayout(page)
+        layout.setSpacing(14)
 
-        header = QLabel("⊞ Installed PC Applications")
+        header = QLabel("⊞ Installed PC Applications & AI Tools")
         header.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
         header.setStyleSheet("color: #38bdf8; border: none; background: transparent;")
+
+        # Featured: AI Virtual Keyboard & Air Mouse Banner Card
+        vk_card = QFrame()
+        vk_card.setStyleSheet("""
+            QFrame {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 rgba(56, 189, 248, 0.12), stop:1 rgba(129, 140, 248, 0.12));
+                border: 1.5px solid rgba(56, 189, 248, 0.5);
+                border-radius: 14px;
+                padding: 10px;
+            }
+        """)
+        vk_layout = QHBoxLayout(vk_card)
+        vk_layout.setContentsMargins(14, 8, 14, 8)
+        vk_layout.setSpacing(16)
+
+        vk_icon = QLabel("⌨")
+        vk_icon.setFont(QFont("Segoe UI", 20))
+        vk_icon.setStyleSheet("color: #38bdf8; border: none; background: transparent;")
+
+        vk_info_box = QVBoxLayout()
+        vk_info_box.setSpacing(2)
+        vk_title = QLabel("AI Virtual Keyboard & Air Mouse")
+        vk_title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        vk_title.setStyleSheet("color: #ffffff; border: none; background: transparent;")
+
+        self.vk_status_lbl = QLabel("Status: READY ○   •   Touchless 3D Hand Gestures & Air Mouse")
+        self.vk_status_lbl.setFont(QFont("Segoe UI", 9))
+        self.vk_status_lbl.setStyleSheet("color: #94a3b8; border: none; background: transparent;")
+
+        vk_info_box.addWidget(vk_title)
+        vk_info_box.addWidget(self.vk_status_lbl)
+
+        self.btn_vk_toggle = QPushButton("▶ LAUNCH KEYBOARD")
+        self.btn_vk_toggle.setFixedHeight(40)
+        self.btn_vk_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_vk_toggle.setStyleSheet("""
+            QPushButton {
+                background: #38bdf8;
+                color: #0b0f19;
+                font-weight: bold;
+                border-radius: 10px;
+                padding: 0 18px;
+                font-size: 12px;
+            }
+            QPushButton:hover { background: #00e5ff; }
+        """)
+        self.btn_vk_toggle.clicked.connect(self._toggle_virtual_keyboard)
+
+        vk_layout.addWidget(vk_icon)
+        vk_layout.addLayout(vk_info_box)
+        vk_layout.addStretch()
+        vk_layout.addWidget(self.btn_vk_toggle)
 
         apps = [
             ("🌐 Google Chrome", "open google chrome"),
@@ -775,12 +826,12 @@ class PhantomGUI(QMainWindow):
 
         grid_widget = QWidget()
         grid = QGridLayout(grid_widget)
-        grid.setSpacing(15)
+        grid.setSpacing(12)
 
         r, c = 0, 0
         for name, cmd in apps:
             btn = QPushButton(name)
-            btn.setFixedHeight(50)
+            btn.setFixedHeight(46)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setStyleSheet("""
                 QPushButton {
@@ -804,10 +855,56 @@ class PhantomGUI(QMainWindow):
                 r += 1
 
         layout.addWidget(header)
+        layout.addWidget(vk_card)
         layout.addWidget(grid_widget)
         layout.addStretch()
 
         return page
+
+    def _toggle_virtual_keyboard(self):
+        if self.vk_controller:
+            success, msg = self.vk_controller.toggle_keyboard()
+            self.log(msg, log_type="cmd")
+            if self.tts_engine:
+                self.tts_engine.speak(msg, block=False)
+            self._update_vk_button_state()
+        elif self.on_command_trigger:
+            self.on_command_trigger("start virtual keyboard")
+
+    def _update_vk_button_state(self):
+        if hasattr(self, 'btn_vk_toggle') and self.vk_controller:
+            if self.vk_controller.is_running():
+                self.btn_vk_toggle.setText("🛑 STOP KEYBOARD")
+                self.btn_vk_toggle.setStyleSheet("""
+                    QPushButton {
+                        background: #ef4444;
+                        color: #ffffff;
+                        font-weight: bold;
+                        border-radius: 10px;
+                        padding: 0 18px;
+                        font-size: 12px;
+                    }
+                    QPushButton:hover { background: #dc2626; }
+                """)
+                if hasattr(self, 'vk_status_lbl'):
+                    self.vk_status_lbl.setText("Status: ACTIVE ●   •   Touchless 3D Hand Gestures & Air Mouse")
+                    self.vk_status_lbl.setStyleSheet("color: #22c55e; font-weight: bold; font-size: 9px; border: none; background: transparent;")
+            else:
+                self.btn_vk_toggle.setText("▶ LAUNCH KEYBOARD")
+                self.btn_vk_toggle.setStyleSheet("""
+                    QPushButton {
+                        background: #38bdf8;
+                        color: #0b0f19;
+                        font-weight: bold;
+                        border-radius: 10px;
+                        padding: 0 18px;
+                        font-size: 12px;
+                    }
+                    QPushButton:hover { background: #00e5ff; }
+                """)
+                if hasattr(self, 'vk_status_lbl'):
+                    self.vk_status_lbl.setText("Status: READY ○   •   Touchless 3D Hand Gestures & Air Mouse")
+                    self.vk_status_lbl.setStyleSheet("color: #94a3b8; font-size: 9px; border: none; background: transparent;")
 
     def _launch_app(self, cmd):
         self.log(f"Launching App: {cmd}", log_type="cmd")
@@ -1168,6 +1265,7 @@ class PhantomGUI(QMainWindow):
             except Exception:
                 pass
 
+        self._update_vk_button_state()
         threading.Thread(target=self._fetch_media_session_dual_engine, daemon=True).start()
 
     def _fetch_media_session_dual_engine(self):
@@ -1248,10 +1346,15 @@ class PhantomGUI(QMainWindow):
             self.btn_play.setText("⏸" if is_playing else "▶")
 
     def log(self, text, log_type="sys"):
+        self.sig_log.emit(str(text), str(log_type))
+
+    def _handle_log(self, text, log_type):
         if hasattr(self, 'terminal_log'):
             clean_t = text.replace("⚡ [DISPATCHER]:", "").replace("[PHANTOM STT HEARD]:", "").strip("'\" ")
             if log_type == "cmd" or "HEARD" in text or "DISPATCHER" in text:
                 self.terminal_log.append(f"\n🎧 [HEARD]: \"{clean_t}\"")
+            elif log_type == "ai":
+                self.terminal_log.append(f"🤖 [REPLY]: {clean_t}")
             else:
                 self.terminal_log.append(f"⚡ [ACTION]: {clean_t}")
             
@@ -1259,8 +1362,11 @@ class PhantomGUI(QMainWindow):
             sb.setValue(sb.maximum())
 
     def set_processing_state(self, is_processing, status_text=""):
+        self.sig_processing.emit(bool(is_processing), str(status_text))
+
+    def _handle_processing(self, is_processing, status_text):
         if status_text:
-            self.log(status_text, log_type="sys")
+            self._handle_log(status_text, "sys")
 
     def show_ai_response_popup(self, query, reply):
         pass

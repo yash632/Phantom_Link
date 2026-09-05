@@ -21,7 +21,7 @@ class TopRow3DDipVirtualKeyboard:
 
         # EMA Landmark Smoothing
         self.smoothed_landmarks = {}
-        self.ema_alpha = 0.70
+        self.ema_alpha = 0.48
 
         # Dynamic Tap Impulse (Velocity Strike) State Tracking
         self.finger_y_history = collections.defaultdict(lambda: collections.deque(maxlen=6))
@@ -64,13 +64,20 @@ class TopRow3DDipVirtualKeyboard:
         self.middle_click_count = 0
         self.mouse_middle_y_hist = collections.deque(maxlen=6)
         self.mouse_ring_y_hist = collections.deque(maxlen=6)
+        self.mouse_index_y_hist = collections.deque(maxlen=6)
 
         # Setup Floating HUD UI
         self.setup_ui()
 
-        # Start Camera Thread
+        self.latest_display_frame = None
+
+        # Start Camera & AI Hand Tracking Pipeline Thread
         self.camera_thread = threading.Thread(target=self.run_cv_pipeline, daemon=True)
         self.camera_thread.start()
+
+        # Start Dedicated Display Thread (Prevents UI hold/drag from blocking camera capture)
+        self.display_thread = threading.Thread(target=self.run_display_pipeline, daemon=True)
+        self.display_thread.start()
 
     # =========================================================================
     # 1. FLOATING OVERLAY UI (Transparent, Draggable & Single Active Key Display)
@@ -403,8 +410,8 @@ class TopRow3DDipVirtualKeyboard:
         
         hands = mp_hands.Hands(
             max_num_hands=2,
-            min_detection_confidence=0.65,
-            min_tracking_confidence=0.65
+            min_detection_confidence=0.70,
+            min_tracking_confidence=0.70
         )
 
         cap = cv2.VideoCapture(0)
@@ -412,9 +419,7 @@ class TopRow3DDipVirtualKeyboard:
             print("[ERROR] Webcam could not be opened.")
             return
 
-        win_title = "AI Virtual Keyboard (3-Row QWERTY Edition)"
-        cv2.namedWindow(win_title, cv2.WINDOW_NORMAL)
-        cv2.setWindowProperty(win_title, cv2.WND_PROP_TOPMOST, 1)
+        # Window display handled in dedicated run_display_pipeline thread
 
         print("[INFO] AI Virtual Keyboard (3D Flex Dip - Top Row) Active!")
 
@@ -433,7 +438,14 @@ class TopRow3DDipVirtualKeyboard:
 
             frame = cv2.flip(frame, 1)
             h, w, _ = frame.shape
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # Daylight & glare compensation: Normalize brightness & contrast via CLAHE on L-channel
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            l_chan, a_chan, b_chan = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            cl = clahe.apply(l_chan)
+            balanced_bgr = cv2.cvtColor(cv2.merge((cl, a_chan, b_chan)), cv2.COLOR_LAB2BGR)
+            rgb_frame = cv2.cvtColor(balanced_bgr, cv2.COLOR_BGR2RGB)
             results = hands.process(rgb_frame)
             now = time.time()
 
@@ -443,19 +455,37 @@ class TopRow3DDipVirtualKeyboard:
             if results.multi_hand_landmarks:
                 detected = []
                 for idx, raw_lms in enumerate(results.multi_hand_landmarks):
+                    conf = 1.0
+                    if results.multi_handedness and idx < len(results.multi_handedness):
+                        conf = results.multi_handedness[idx].classification[0].score
+
+                    if conf < 0.60:
+                        continue  # Skip low-confidence artifacts/reflections
+
                     smooth_lms = self.apply_ema_smoothing(idx, raw_lms.landmark)
                     # Use center of palm (wrist + MCPs)
                     mean_x = (smooth_lms[0][0] + smooth_lms[5][0] + smooth_lms[17][0]) / 3
-                    detected.append((mean_x, smooth_lms, raw_lms))
+                    detected.append((mean_x, smooth_lms, raw_lms, conf))
+
+                # Discard duplicate / phantom second hand detections on the same physical hand
+                if len(detected) >= 2:
+                    wrist_dist = self.dist(detected[0][1][0], detected[1][1][0])
+                    palm_dist = self.dist(detected[0][1][9], detected[1][1][9])
+                    # If two detections are physically overlapping (wrist < 0.20 or palm < 0.18), keep only the higher confidence one
+                    if wrist_dist < 0.20 or palm_dist < 0.18:
+                        if detected[1][3] > detected[0][3]:
+                            detected = [detected[1]]
+                        else:
+                            detected = [detected[0]]
 
                 detected.sort(key=lambda x: x[0])
                 if len(detected) == 1:
                     # In mirrored view: Left side of image (x < 0.52) is User's LEFT hand
                     label = "Left" if detected[0][0] < 0.52 else "Right"
-                    assigned_hands[label] = detected[0]
+                    assigned_hands[label] = (detected[0][0], detected[0][1], detected[0][2])
                 elif len(detected) >= 2:
-                    assigned_hands["Left"] = detected[0]
-                    assigned_hands["Right"] = detected[1]
+                    assigned_hands["Left"] = (detected[0][0], detected[0][1], detected[0][2])
+                    assigned_hands["Right"] = (detected[1][0], detected[1][1], detected[1][2])
             else:
                 self.smoothed_landmarks.clear()
 
@@ -518,10 +548,17 @@ class TopRow3DDipVirtualKeyboard:
                 # -------------------------------------------------------------
                 pinky_tip_pt = smooth_lms[20]
                 pinky_thumb_dist = self.dist(thumb_tip, pinky_tip_pt) / ref_hand_scale
+                pinky_index_dist = self.dist(index_tip, pinky_tip_pt) / ref_hand_scale
 
                 if pinky_thumb_dist < 0.14 and self.pinky_thumb_state == 'READY':
                     self.pinky_thumb_state = 'TOUCHED'
                     self.drag_mode_active = not self.drag_mode_active
+                    # Flush click histories so hand curling does not trigger clicks
+                    self.mouse_middle_y_hist.clear()
+                    self.mouse_ring_y_hist.clear()
+                    self.mouse_index_y_hist.clear()
+                    self.mouse_middle_state = 'READY'
+                    self.mouse_ring_state = 'READY'
 
                     if self.drag_mode_active:
                         pyautogui.mouseDown()
@@ -535,30 +572,35 @@ class TopRow3DDipVirtualKeyboard:
                         self.last_triggered_key = "DRAG MODE OFF (RELEASED)"
                         threading.Thread(target=lambda: winsound.Beep(1000, 45), daemon=True).start()
                         print("[INFO] TOGGLE DRAG MODE: OFF (MouseUp)")
-                elif pinky_thumb_dist >= 0.18:
+                elif pinky_thumb_dist >= 0.20:
                     self.pinky_thumb_state = 'READY'
 
                 # Visual overlay feedback for Toggle Drag Mode
                 if self.drag_mode_active:
-                    cv2.putText(frame, "[DRAG MODE ON - SELECTING]", (15, h - 25), 
+                    cv2.putText(frame, "[DRAG MODE ON - SELECTING]", (15, h - 25),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 0), 2)
 
                 # -------------------------------------------------------------
-                # 2. VIRTUAL MOUSE CLICK GESTURES (Disabled during Drag Mode):
-                #    - Middle Finger Dip -> 1x Left Click / 2x Double Click / 3x Triple Click
-                #    - Ring Finger Dip -> Right Click
+                # 2. VIRTUAL MOUSE CLICK GESTURES (Disabled during Drag Mode & Pinky Pinch):
+                #    - Middle Finger Dip -> 1x Left Click / 2x Double Click / 3x Triple Click (Isolated)
+                #    - Ring Finger Dip -> Right Click (Isolated)
                 # -------------------------------------------------------------
-                if not self.drag_mode_active:
+                is_pinky_in_gesture = (pinky_thumb_dist < 0.26) or (pinky_index_dist < 0.24) or (self.pinky_thumb_state == 'TOUCHED')
+
+                if not self.drag_mode_active and not is_pinky_in_gesture:
                     middle_tip_pt = smooth_lms[12]
                     middle_mcp_pt = smooth_lms[9]
                     ring_tip_pt = smooth_lms[16]
                     ring_mcp_pt = smooth_lms[13]
+                    index_mcp_pt = smooth_lms[5]
 
                     mid_rel_y = (middle_tip_pt[1] - middle_mcp_pt[1]) / ref_hand_scale
                     rng_rel_y = (ring_tip_pt[1] - ring_mcp_pt[1]) / ref_hand_scale
+                    idx_rel_y = (index_tip[1] - index_mcp_pt[1]) / ref_hand_scale
 
                     self.mouse_middle_y_hist.append((mid_rel_y, now))
                     self.mouse_ring_y_hist.append((rng_rel_y, now))
+                    self.mouse_index_y_hist.append((idx_rel_y, now))
 
                     # Evaluate Middle Finger Multi-Tap (1x Left, 2x Double, 3x Triple Click)
                     m_vel, m_dy = 0.0, 0.0
@@ -567,7 +609,16 @@ class TopRow3DDipVirtualKeyboard:
                         m_dy = self.mouse_middle_y_hist[-1][0] - self.mouse_middle_y_hist[0][0]
                         m_vel = (m_dy / m_dt) if m_dt > 0.001 else 0.0
 
-                    if m_vel > 0.88 and m_dy > 0.018 and self.mouse_middle_state == 'READY':
+                    r_vel, r_dy = 0.0, 0.0
+                    if len(self.mouse_ring_y_hist) >= 3:
+                        r_dt = self.mouse_ring_y_hist[-1][1] - self.mouse_ring_y_hist[0][1]
+                        r_dy = self.mouse_ring_y_hist[-1][0] - self.mouse_ring_y_hist[0][0]
+                        r_vel = (r_dy / r_dt) if r_dt > 0.001 else 0.0
+
+                    # Isolation check: Middle must move downward while Ring is NOT dipping simultaneously
+                    is_mid_isolated = (m_vel - r_vel > 0.35) and (m_dy > r_dy + 0.008) and (r_dy < 0.016) and (pinch_dist > 0.16)
+
+                    if m_vel > 0.88 and m_dy > 0.018 and is_mid_isolated and self.mouse_middle_state == 'READY':
                         self.mouse_middle_state = 'DIPPED'
                         cx, cy = int(middle_tip_pt[0] * w), int(middle_tip_pt[1] * h)
 
@@ -602,24 +653,27 @@ class TopRow3DDipVirtualKeyboard:
                     elif m_vel < 0.25 or m_dy < 0.005 or (now - self.last_middle_click_time > 0.25):
                         self.mouse_middle_state = 'READY'
 
-                # Evaluate Ring Finger Dip (Right Click)
-                r_vel, r_dy = 0.0, 0.0
-                if len(self.mouse_ring_y_hist) >= 3:
-                    r_dt = self.mouse_ring_y_hist[-1][1] - self.mouse_ring_y_hist[0][1]
-                    r_dy = self.mouse_ring_y_hist[-1][0] - self.mouse_ring_y_hist[0][0]
-                    r_vel = (r_dy / r_dt) if r_dt > 0.001 else 0.0
+                    # Isolation check: Ring must move downward while Middle is NOT dipping simultaneously
+                    is_ring_isolated = (r_vel - m_vel > 0.35) and (r_dy > m_dy + 0.008) and (m_dy < 0.016) and (pinch_dist > 0.16)
 
-                if r_vel > 0.88 and r_dy > 0.018 and self.mouse_ring_state == 'READY':
-                    self.mouse_ring_state = 'DIPPED'
-                    pyautogui.rightClick()
-                    self.flash_display_time = now
-                    self.last_triggered_key = "RIGHT CLICK"
+                    if r_vel > 0.88 and r_dy > 0.018 and is_ring_isolated and self.mouse_ring_state == 'READY':
+                        self.mouse_ring_state = 'DIPPED'
+                        pyautogui.rightClick()
+                        self.flash_display_time = now
+                        self.last_triggered_key = "RIGHT CLICK"
 
-                    cx, cy = int(ring_tip_pt[0] * w), int(ring_tip_pt[1] * h)
-                    cv2.circle(frame, (cx, cy), 24, (255, 0, 255), cv2.FILLED)
-                    cv2.putText(frame, "RIGHT CLICK", (cx - 45, cy - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 0, 255), 2)
-                    threading.Thread(target=lambda: winsound.Beep(1400, 40), daemon=True).start()
-                elif r_vel < 0.25 or r_dy < 0.005 or (now - self.flash_display_time > 0.25):
+                        cx, cy = int(ring_tip_pt[0] * w), int(ring_tip_pt[1] * h)
+                        cv2.circle(frame, (cx, cy), 24, (255, 0, 255), cv2.FILLED)
+                        cv2.putText(frame, "RIGHT CLICK", (cx - 45, cy - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 0, 255), 2)
+                        threading.Thread(target=lambda: winsound.Beep(1400, 40), daemon=True).start()
+                    elif r_vel < 0.25 or r_dy < 0.005 or (now - self.flash_display_time > 0.25):
+                        self.mouse_ring_state = 'READY'
+                else:
+                    # While dragging or pinky pinching, keep click states primed and histories clear
+                    self.mouse_middle_y_hist.clear()
+                    self.mouse_ring_y_hist.clear()
+                    self.mouse_index_y_hist.clear()
+                    self.mouse_middle_state = 'READY'
                     self.mouse_ring_state = 'READY'
             else:
                 # Disable Mouse Mode when 2 hands (or 0 hands) are present -> Enable Keyboard Typing Mode
@@ -633,55 +687,66 @@ class TopRow3DDipVirtualKeyboard:
                 self.smooth_mouse_dx = 0.0
                 self.smooth_mouse_dy = 0.0
 
-            # -----------------------------------------------------------------
-            # GESTURE 1: SPACE (Both index Touch -> Enter)
-            # -----------------------------------------------------------------
+            # -------------------------------------------------------------
+            # GESTURE 1: ENTER (Both index Touch -> Enter)
+            # -------------------------------------------------------------
             is_enter_active = False
             if "Left" in assigned_hands and "Right" in assigned_hands:
-                l_index = assigned_hands["Left"][1][8]
-                r_index = assigned_hands["Right"][1][8]
-                if (self.dist(l_index, r_index) / ref_hand_scale) < 0.28:
-                    is_enter_active = True
-                    cx1, cy1 = int(l_index[0] * w), int(l_index[1] * h)
-                    cx2, cy2 = int(r_index[0] * w), int(r_index[1] * h)
-                    cv2.line(frame, (cx1, cy1), (cx2, cy2), (200, 100, 255), 4)
-                    cv2.circle(frame, (int((cx1+cx2)/2), int((cy1+cy2)/2)), 24, (200, 100, 255), cv2.FILLED)
-                    cv2.putText(frame, "ENTER KEY", (int((cx1+cx2)/2) - 60, int((cy1+cy2)/2) - 25), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (200, 100, 255), 2)
+                wrist_l = assigned_hands["Left"][1][0]
+                wrist_r = assigned_hands["Right"][1][0]
+                # True physical hand separation check: Wrists must be clearly separated
+                if self.dist(wrist_l, wrist_r) > 0.20:
+                    l_index = assigned_hands["Left"][1][8]
+                    r_index = assigned_hands["Right"][1][8]
+                    if (self.dist(l_index, r_index) / ref_hand_scale) < 0.28:
+                        is_enter_active = True
+                        cx1, cy1 = int(l_index[0] * w), int(l_index[1] * h)
+                        cx2, cy2 = int(r_index[0] * w), int(r_index[1] * h)
+                        cv2.line(frame, (cx1, cy1), (cx2, cy2), (200, 100, 255), 4)
+                        cv2.circle(frame, (int((cx1+cx2)/2), int((cy1+cy2)/2)), 24, (200, 100, 255), cv2.FILLED)
+                        cv2.putText(frame, "ENTER KEY", (int((cx1+cx2)/2) - 60, int((cy1+cy2)/2) - 25),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (200, 100, 255), 2)
 
-                    if not self.index_are_touching:
-                        self.index_are_touching = True
-                        self.trigger_action('ENTER', 'ENTER_TRIGGER')
+                        if not self.index_are_touching:
+                            self.index_are_touching = True
+                            self.trigger_action('ENTER', 'ENTER_TRIGGER')
+                    else:
+                        self.index_are_touching = False
                 else:
                     self.index_are_touching = False
 
-            # -----------------------------------------------------------------
-            # GESTURE 2: ENTER (Both index Touch Deliberately)
-            # -----------------------------------------------------------------
+            # -------------------------------------------------------------
+            # GESTURE 2: BACKSPACE (Both thumbs Touch Deliberately)
+            # -------------------------------------------------------------
             is_backspace_active = False
             if not is_enter_active:
                 if "Left" in assigned_hands and "Right" in assigned_hands:
-                    l_thumb = assigned_hands["Left"][1][4]
-                    r_thumb = assigned_hands["Right"][1][4]
-                    thumb_contact_dist = self.dist(l_thumb, r_thumb) / ref_hand_scale
+                    wrist_l = assigned_hands["Left"][1][0]
+                    wrist_r = assigned_hands["Right"][1][0]
+                    if self.dist(wrist_l, wrist_r) > 0.20:
+                        l_thumb = assigned_hands["Left"][1][4]
+                        r_thumb = assigned_hands["Right"][1][4]
+                        thumb_contact_dist = self.dist(l_thumb, r_thumb) / ref_hand_scale
 
-                    if thumb_contact_dist < 0.25:
-                        is_backspace_active = True
-                        cx1, cy1 = int(l_thumb[0] * w), int(l_thumb[1] * h)
-                        cx2, cy2 = int(r_thumb[0] * w), int(r_thumb[1] * h)
-                        cv2.line(frame, (cx1, cy1), (cx2, cy2), (0, 0, 255), 4)
-                        cv2.circle(frame, (int((cx1+cx2)/2), int((cy1+cy2)/2)), 22, (0, 0, 255), cv2.FILLED)
-                        cv2.putText(frame, "BACKSPACE", (int((cx1+cx2)/2) - 60, int((cy1+cy2)/2) - 25), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                        if thumb_contact_dist < 0.25:
+                            is_backspace_active = True
+                            cx1, cy1 = int(l_thumb[0] * w), int(l_thumb[1] * h)
+                            cx2, cy2 = int(r_thumb[0] * w), int(r_thumb[1] * h)
+                            cv2.line(frame, (cx1, cy1), (cx2, cy2), (0, 0, 255), 4)
+                            cv2.circle(frame, (int((cx1+cx2)/2), int((cy1+cy2)/2)), 22, (0, 0, 255), cv2.FILLED)
+                            cv2.putText(frame, "BACKSPACE", (int((cx1+cx2)/2) - 60, int((cy1+cy2)/2) - 25),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-                        if not self.thumbs_are_touching:
-                            self.thumbs_are_touching = True
-                            self.trigger_action('BACKSPACE', 'BACKSPACE_TRIGGER')
-                            self.last_backspace_time = time.time()
-                        else:
-                            if time.time() - self.last_backspace_time > 0.30:
+                            if not self.thumbs_are_touching:
+                                self.thumbs_are_touching = True
                                 self.trigger_action('BACKSPACE', 'BACKSPACE_TRIGGER')
                                 self.last_backspace_time = time.time()
+                            else:
+                                if time.time() - self.last_backspace_time > 0.30:
+                                    self.trigger_action('BACKSPACE', 'BACKSPACE_TRIGGER')
+                                    self.last_backspace_time = time.time()
+                        else:
+                            self.thumbs_are_touching = False
                     else:
                         self.thumbs_are_touching = False
 
@@ -925,15 +990,29 @@ class TopRow3DDipVirtualKeyboard:
             
             cv2.putText(frame, status_str, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.38, status_col, 2)
 
-            cv2.imshow("AI Virtual Keyboard (3-Row QWERTY Edition)", frame)
-            if cv2.waitKey(1) & 0xFF == 27:
-                self.close_app()
-                break
-
-            time.sleep(0.01)
+            self.latest_display_frame = frame
+            time.sleep(0.005)
 
         cap.release()
-        cv2.destroyAllWindows()
+
+    def run_display_pipeline(self):
+        win_title = "AI Virtual Keyboard (3-Row QWERTY Edition)"
+        cv2.namedWindow(win_title, cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty(win_title, cv2.WND_PROP_TOPMOST, 1)
+
+        while self.is_running:
+            if self.latest_display_frame is not None:
+                cv2.imshow(win_title, self.latest_display_frame)
+            key = cv2.waitKey(10)
+            if key & 0xFF == 27:
+                self.close_app()
+                break
+            time.sleep(0.005)
+
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
 
     def close_app(self):
         self.is_running = False
